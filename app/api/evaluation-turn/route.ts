@@ -11,7 +11,7 @@ import {
   serializeRun,
   type Turn,
 } from '@/lib/run-store';
-import { collapseRestartedReply } from '@/lib/reply';
+import { capMessage, collapseRestartedReply } from '@/lib/reply';
 
 /**
  * The candidate-agent/1 endpoint the evaluator's synthetic patient talks to.
@@ -80,7 +80,48 @@ function reply(body: unknown, status = 200) {
   return Response.json(body, { status });
 }
 
+/**
+ * Nothing may leave this route that is not a well-formed turn response.
+ *
+ * The protocol treats invalid JSON, a mismatched id, an unsupported status, an
+ * oversized body and a timeout alike: not as a scheduling failure but as a
+ * candidate-endpoint error that ends the whole run. An unhandled exception here
+ * would be answered by the framework with a 500 and an HTML-ish body, throwing
+ * away every turn that had already gone well — so the handler is wrapped, and
+ * the wrapper answers with the same apology the patient would have got from a
+ * failed turn.
+ */
 export async function POST(req: Request) {
+  // Filled in as soon as they are known, so the last resort can still echo the
+  // ids the protocol requires.
+  const echo: { runId?: string; turnId?: string; version?: string } = {};
+
+  try {
+    return await handleTurn(req, echo);
+  } catch (err) {
+    console.error(
+      `[evaluation-turn] run=${echo.runId ?? '?'} turn=${echo.turnId ?? '?'} ` +
+        'unhandled failure:',
+      err instanceof Error ? err.name : 'unknown error',
+    );
+
+    // Before the ids are known there is no well-formed response to give, and a
+    // JSON 500 is the honest answer. After, the turn can still be answered.
+    return echo.runId && echo.turnId
+      ? reply(
+          envelope(echo.version, echo.runId, echo.turnId, {
+            message: FALLBACK,
+            status: 'continue',
+          }),
+        )
+      : reply({ error: 'internal error' }, 500);
+  }
+}
+
+async function handleTurn(
+  req: Request,
+  echo: { runId?: string; turnId?: string; version?: string },
+) {
   /**
    * One clock for the whole request, started before anything else happens.
    *
@@ -117,6 +158,10 @@ export async function POST(req: Request) {
   const { run_id, turn_id, input, resources, protocol_version } = parsed.data;
   const { base_url, api_key } = resources.dental_api;
 
+  echo.runId = run_id;
+  echo.turnId = turn_id;
+  echo.version = protocol_version;
+
   // Idempotency, in layers, cheapest first: a turn this process already
   // answered replays verbatim, and a retry that races the original awaits it
   // instead of acting twice.
@@ -127,7 +172,19 @@ export async function POST(req: Request) {
 
     const racing = local.inFlight.get(turn_id);
     if (racing) {
-      return reply(envelope(protocol_version, run_id, turn_id, await racing));
+      // Caught, not awaited bare: `work` rejects on both the deadline and the
+      // crash path, and letting that propagate would answer a retry with a 500
+      // — an endpoint error that ends the run, when the original attempt is
+      // meanwhile handling its own failure properly.
+      const raced = await racing.catch(() => null);
+      return reply(
+        envelope(
+          protocol_version,
+          run_id,
+          turn_id,
+          raced ?? { message: FALLBACK, status: 'continue' },
+        ),
+      );
     }
   }
 
@@ -199,7 +256,8 @@ export async function POST(req: Request) {
     // leave `run.messages` exactly as it found it: appending the patient's line
     // up front means a retry of a failed turn appends it a second time, and the
     // model then answers a question it can see asked twice.
-    const messages = [...run.messages, { role: 'user' as const, content: input.message }];
+    const patientSaid = { role: 'user' as const, content: input.message };
+    const messages = [...run.messages, patientSaid];
 
     const result = await runAgentOnce({
       messages,
@@ -215,7 +273,13 @@ export async function POST(req: Request) {
     // Committed only now that the turn has produced something: the full step
     // history, tool calls and results included, so later turns keep the
     // patientId and the slots we already paid to fetch.
-    run.messages = [...messages, ...result.response.messages];
+    //
+    // Appended to whatever the run holds *now*, not to the snapshot taken
+    // above. Writing the snapshot back would make this a read-modify-write: two
+    // attempts overlapping on one run — the premise of every retry path here —
+    // would both start from the same base, and the one that finished second
+    // would erase the other's turn entirely.
+    run.messages = [...run.messages, patientSaid, ...result.response.messages];
 
     // Tool names only — never arguments, which carry patient data and could
     // carry the key. Without this it is impossible to tell a real booking from
@@ -319,7 +383,9 @@ function envelope(
     protocol_version: protocolVersion ?? PROTOCOL_VERSION,
     run_id: runId,
     turn_id: turnId,
-    output: { message: turn.message },
+    // Capped here, at the one place every answer passes through, rather than
+    // at each of the places one is produced.
+    output: { message: capMessage(turn.message) },
     status: turn.status,
   };
 }

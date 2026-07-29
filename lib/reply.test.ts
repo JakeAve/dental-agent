@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { collapseRestartedReply } from './reply';
+import { capMessage, collapseRestartedReply, MAX_MESSAGE_BYTES } from './reply';
 
 // Both duplicated samples below are verbatim captures from gpt-5.4-mini via
 // runAgentOnce on 2026-07-29 — the model restarted its reply inside a single
@@ -51,5 +51,51 @@ describe('collapseRestartedReply', () => {
     expect(collapseRestartedReply('Done. Anything else?\nDone.')).toBe(
       'Done. Anything else?\nDone.',
     );
+  });
+});
+
+/**
+ * The protocol's 256 KiB is not a quality bar but a run-ending one: an
+ * oversized body is scored as a candidate-endpoint error, so every turn that
+ * went well before it is lost with it.
+ */
+describe('capMessage', () => {
+  it('leaves a normal reply exactly as it is', () => {
+    const reply = 'You are booked for Thursday, July 30 at 9:00 AM with Dr Chen.';
+    expect(capMessage(reply)).toBe(reply);
+  });
+
+  it('passes a long-but-sane reply through untouched', () => {
+    // Far longer than anything a receptionist would say, still nowhere near
+    // the ceiling — the cap must not be trimming real answers.
+    const reply = 'Here are the times I have. '.repeat(200);
+    expect(capMessage(reply)).toBe(reply);
+  });
+
+  it('brings a runaway reply under the ceiling', () => {
+    const runaway = 'x'.repeat(MAX_MESSAGE_BYTES * 3);
+    const capped = capMessage(runaway);
+
+    expect(new TextEncoder().encode(capped).length).toBeLessThanOrEqual(
+      MAX_MESSAGE_BYTES,
+    );
+    expect(capped.length).toBeLessThan(runaway.length);
+  });
+
+  it('counts bytes rather than characters, and splits no character in half', () => {
+    // Four bytes each: a cap measured in characters would let this through at
+    // four times the intended size, and a naive byte slice would cut one in two.
+    const emoji = '🦷'.repeat(MAX_MESSAGE_BYTES);
+    const capped = capMessage(emoji);
+
+    expect(new TextEncoder().encode(capped).length).toBeLessThanOrEqual(
+      MAX_MESSAGE_BYTES,
+    );
+    expect(capped).not.toContain('�');
+    expect([...capped].every((c) => c === '🦷' || c === '…')).toBe(true);
+  });
+
+  it('never returns an empty message, which is its own violation', () => {
+    expect(capMessage('x'.repeat(MAX_MESSAGE_BYTES + 1)).trim()).not.toBe('');
   });
 });
