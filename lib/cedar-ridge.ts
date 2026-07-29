@@ -16,6 +16,17 @@ import { z } from 'zod';
 export type CedarRidgeConfig = {
   baseUrl: string;
   apiKey: string;
+  /**
+   * Aborts every request this client makes.
+   *
+   * The protocol requires background work to stop when a turn ends. Cancelling
+   * the model loop alone is not enough: a tool call already in flight keeps
+   * going, and each one spends from a run-scoped key with a published call
+   * budget — so a turn we already gave up on would quietly bill the budget the
+   * *next* turn needs. A client is built per turn, so a client-wide signal is
+   * the right granularity.
+   */
+  signal?: AbortSignal;
 };
 
 /** Every error code the API documents, plus a catch-all for anything new. */
@@ -227,7 +238,7 @@ export type RegisterPatientInput = {
  * Client
  * ------------------------------------------------------------------ */
 
-export function createClient({ baseUrl, apiKey }: CedarRidgeConfig) {
+export function createClient({ baseUrl, apiKey, signal }: CedarRidgeConfig) {
   if (!baseUrl || !apiKey) {
     throw new Error('createClient requires both baseUrl and apiKey');
   }
@@ -241,6 +252,9 @@ export function createClient({ baseUrl, apiKey }: CedarRidgeConfig) {
   ): Promise<z.infer<T>> {
     const res = await fetch(`${root}/api/v1${path}`, {
       ...init,
+      // After the spread, deliberately: the turn's deadline outranks anything
+      // a caller might pass per request.
+      signal,
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',

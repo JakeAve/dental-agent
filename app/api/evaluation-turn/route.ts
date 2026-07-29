@@ -107,13 +107,30 @@ export async function POST(req: Request) {
     return reply(envelope(protocol_version, run_id, turn_id, await racing));
   }
 
+  /**
+   * The turn's kill switch.
+   *
+   * The protocol requires background work to stop when the turn ends, and a
+   * plain `Promise.race` does not do that — it resolves the caller while the
+   * loop keeps running, still calling the scheduling API on a key with a
+   * finite budget. So the deadline aborts rather than merely giving up: the
+   * model stops taking steps, and the in-flight request is dropped with it.
+   */
+  const control = new AbortController();
+  const deadline = setTimeout(() => control.abort(), TURN_DEADLINE_MS);
+
   const work = (async (): Promise<Turn> => {
     run.messages.push({ role: 'user', content: input.message });
 
     const result = await runAgentOnce({
       messages: run.messages,
-      client: createClient({ baseUrl: base_url, apiKey: api_key }),
+      client: createClient({
+        baseUrl: base_url,
+        apiKey: api_key,
+        signal: control.signal,
+      }),
       session: run.session,
+      abortSignal: control.signal,
     });
 
     // Feed the full step history — including tool calls and their results —
@@ -153,18 +170,23 @@ export async function POST(req: Request) {
 
   let turn: Turn;
   try {
-    turn = await withDeadline(work, TURN_DEADLINE_MS);
+    turn = await work;
     run.turns.set(turn_id, turn);
   } catch (err) {
     // Deliberately no error detail in the response: the key travels in this
     // request, and a leaked message is a scored failure.
     console.error(
-      `[evaluation-turn] run=${run_id} turn=${turn_id} failed:`,
+      `[evaluation-turn] run=${run_id} turn=${turn_id} ` +
+        `${control.signal.aborted ? `exceeded ${TURN_DEADLINE_MS}ms` : 'failed'}:`,
       err instanceof Error ? err.message : 'unknown error',
     );
     turn = { message: FALLBACK, status: 'continue' };
     // Not cached — a retry of a timed-out turn deserves a real attempt.
   } finally {
+    // Both matter: an un-cleared timer would abort a client that finished in
+    // time (harmless here, but it keeps the process alive), and a live entry
+    // would strand a later retry awaiting a promise that is already settled.
+    clearTimeout(deadline);
     run.inFlight.delete(turn_id);
   }
 
@@ -184,13 +206,4 @@ function envelope(
     output: { message: turn.message },
     status: turn.status,
   };
-}
-
-function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`agent exceeded ${ms}ms`)), ms),
-    ),
-  ]);
 }

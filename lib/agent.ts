@@ -184,6 +184,12 @@ export type AgentRun = {
   client?: CedarRidgeClient;
   session?: Session;
   now?: Date;
+  /**
+   * Stops the loop mid-flight. Passed to the model so no further step begins;
+   * the same signal is given to the scheduling client so a request already in
+   * flight is dropped too.
+   */
+  abortSignal?: AbortSignal;
 };
 
 export type AgentStreamRun = AgentRun & {
@@ -220,6 +226,7 @@ export async function runAgentOnce({
   client = envClient(),
   session = createSession(),
   now = new Date(),
+  abortSignal,
 }: AgentRun) {
   return generateText({
     model: model(),
@@ -227,6 +234,7 @@ export async function runAgentOnce({
     messages,
     tools: createTools(client, session),
     stopWhen: isStepCount(STEP_BUDGET),
+    abortSignal,
   });
 }
 

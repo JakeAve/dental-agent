@@ -23,6 +23,8 @@ export type RecordedCall = {
   path: string;
   status: number;
   durationMs: number;
+  /** Epoch ms when the request *arrived*. Used to prove work stopped. */
+  at: number;
 };
 
 export type Proxy = {
@@ -57,6 +59,11 @@ export async function startProxy(options: {
   scenario: string;
   /** Hard ceiling on bookings this scenario may create. */
   maxBookings: number;
+  /**
+   * Artificial latency per call. Used to push a turn past its deadline without
+   * touching product code, so the abort path can be exercised for real.
+   */
+  delayMs?: number;
 }): Promise<Proxy> {
   const target = options.target.replace(/\/+$/, '');
 
@@ -66,14 +73,28 @@ export async function startProxy(options: {
   let refusedBookings = 0;
 
   const server: Server = createServer((req, res) => {
+    // A cancelled turn aborts its in-flight request, which lands here as an
+    // ECONNRESET on the socket. That is the abort working, not a fault — but
+    // without listeners Node raises it as an unhandled rejection and the test
+    // runner reports a passing suite as suspect.
+    req.on('error', () => {});
+    res.on('error', () => {});
+
     void (async () => {
       const started = Date.now();
       const path = req.url ?? '/';
       const method = req.method ?? 'GET';
 
+      // Body first, then latency: delaying before draining the request stream
+      // means an abort arrives while the body is still unread, which throws
+      // here rather than at the point the delay is meant to simulate.
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(chunk as Buffer);
       const body = Buffer.concat(chunks);
+
+      if (options.delayMs) {
+        await new Promise((r) => setTimeout(r, options.delayMs));
+      }
 
       const isBooking = method === 'POST' && normalize(path) === '/api/v1/appointments';
 
@@ -87,6 +108,7 @@ export async function startProxy(options: {
           path,
           status: 409,
           durationMs: 0,
+          at: started,
         });
         res.writeHead(409, { 'content-type': 'application/json' });
         res.end(CAP_REACHED);
@@ -117,6 +139,7 @@ export async function startProxy(options: {
           path,
           status: upstream.status,
           durationMs: Date.now() - started,
+          at: started,
         });
 
         // Capture ids on the way back. Written to the durable ledger first, so
@@ -149,19 +172,27 @@ export async function startProxy(options: {
           path,
           status: 599,
           durationMs: Date.now() - started,
+          at: started,
         });
-        res.writeHead(502, { 'content-type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            error: {
-              code: 'UNKNOWN',
-              message: err instanceof Error ? err.message : 'proxy failure',
-              details: {},
-            },
-          }),
-        );
+        // The socket may already be gone if this was an abort; writing to it
+        // would throw a second time.
+        if (!res.writableEnded) {
+          res.writeHead(502, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              error: {
+                code: 'UNKNOWN',
+                message: err instanceof Error ? err.message : 'proxy failure',
+                details: {},
+              },
+            }),
+          );
+        }
       }
-    })();
+    })().catch(() => {
+      // Reaching here means the client vanished mid-request. Nothing to report:
+      // the call is already recorded, and the test asserts on arrival times.
+    });
   });
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
