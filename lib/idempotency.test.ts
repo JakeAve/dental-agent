@@ -36,15 +36,17 @@ function fakeRedis(): RedisLike & { store: Map<string, unknown> } {
      * do is let the store's own behaviour around the script be tested here.
      */
     async eval(_script, keys, args) {
-      const [body, seq] = args as [string, number];
-      const current = store.get(keys[0]) as { seq?: unknown } | undefined;
+      const [body, seq, rev] = args as [string, number, number];
+      const current = store.get(keys[0]) as
+        | { seq?: unknown; rev?: unknown }
+        | undefined;
 
-      if (
-        current &&
-        typeof current.seq === 'number' &&
-        current.seq >= Number(seq)
-      ) {
-        return 0 as never;
+      if (current && typeof current.seq === 'number') {
+        const currentRev = typeof current.rev === 'number' ? current.rev : 0;
+        if (current.seq > Number(seq)) return 0 as never;
+        if (current.seq === Number(seq) && currentRev >= Number(rev)) {
+          return 0 as never;
+        }
       }
 
       store.set(keys[0], JSON.parse(body));
@@ -71,7 +73,8 @@ const TURN: Turn = { message: 'Are you a new or returning patient?', status: 'co
 const RUN_AT_1 = {
   session: { slotRefs: [] as never[], booked: [] as never[], resolved: false },
   messages: [],
-  seq: 1,
+  seq: 0,
+  rev: 1,
 };
 
 describe('claimTurn', () => {
@@ -129,6 +132,7 @@ describe('saveRun / loadRun', () => {
     session: { slotRefs: [] as never[], booked: [] as never[], resolved: false },
     messages: [{ role: 'user' as const, content: 'I need a cleaning.' }],
     seq: 1,
+    rev: 1,
   };
 
   it('round-trips a run for the instance that takes the next turn', async () => {

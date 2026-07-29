@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { addDays, practiceDate } from './time';
+import { addDays, isCalendarDate, practiceDate } from './time';
 
 /**
  * The API's date parameters are calendar days at the office, and the office is
@@ -46,5 +46,29 @@ describe('addDays', () => {
 
   it('handles a leap day', () => {
     expect(addDays('2028-02-28', 1)).toBe('2028-02-29');
+  });
+});
+
+describe('addDays, on a date it cannot read', () => {
+  it('gives nothing back rather than throwing', () => {
+    // These arrive from a model. A RangeError out of toISOString is not a
+    // recoverable tool result — withRecovery rethrows it and the turn dies.
+    for (const bad of ['', 'next Tuesday', '2026-08-05T00:00:00Z', 'August 5', '2026-8-5']) {
+      expect(addDays(bad, 60)).toBeUndefined();
+    }
+  });
+});
+
+describe('isCalendarDate', () => {
+  it('accepts only a zero-padded YYYY-MM-DD', () => {
+    expect(isCalendarDate('2026-08-05')).toBe(true);
+    expect(isCalendarDate('2026-8-5')).toBe(false);
+    expect(isCalendarDate('2026-08-05T00:00:00Z')).toBe(false);
+    expect(isCalendarDate(undefined)).toBe(false);
+  });
+
+  it('is what makes a window comparison safe', () => {
+    // The reason it exists: this comparison is true, and it is nonsense.
+    expect('2026-8-5' < '2026-09-27').toBe(false);
   });
 });

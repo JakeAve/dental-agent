@@ -58,16 +58,15 @@ type Run = {
   session: Session;
   messages: ModelMessage[];
   /**
-   * How many turns of state this copy has absorbed.
+   * How many times this copy has been published.
    *
-   * Instances stay warm, so "this process already has the run" does not mean
-   * "this process has the latest run": A can serve turn 1, B serve turns 2 and
-   * 3, and then A get turn 4 still holding what it knew after turn 1. Without a
-   * version there is no way to notice — A would answer from a session with no
-   * hold and no booking, and then publish that over B's. Monotonic per run, and
-   * compared, never trusted as a count of anything.
+   * The ordering that matters is the message count, which is intrinsic — see
+   * `versionOf`. This is only the tie-break beneath it, for a publish that
+   * changes the session without adding a message: a turn killed after its
+   * booking landed has exactly the same messages as before and a session that
+   * must not be lost.
    */
-  seq: number;
+  rev: number;
   /** Completed turns, so a transport retry replays instead of re-acting. */
   turns: Map<string, Turn>;
   /** Turns still running, so a retry that races the original waits for it. */
@@ -135,23 +134,19 @@ export function getRun(
           role: h.role === 'patient' ? ('user' as const) : ('assistant' as const),
           content: h.content,
         })),
-      // Zero when the stored copy could not be read, rather than its version:
-      // this run has no idea what that copy knew, so claiming its place in the
-      // order would let a history-only session outrank the real thing and be
-      // adopted by the instances still holding it.
-      seq: restored?.seq ?? 0,
+      rev: restored?.rev ?? 0,
       turns: new Map(),
       inFlight: new Map(),
       lastTouched: now,
     };
     runs.set(runId, run);
-  } else if (restored && restored.seq > run.seq && notBehind(restored, run)) {
+  } else if (restored && shouldAdopt(restored, run)) {
     // Another instance has taken this run further. Adopt its state in place —
     // the Run object itself must survive, because the in-flight and completed
     // turn maps hanging off it are this process's own idempotency record.
     run.session = restored.session;
     run.messages = restored.messages;
-    run.seq = restored.seq;
+    run.rev = restored.rev;
   }
 
   run.lastTouched = now;
@@ -159,25 +154,41 @@ export function getRun(
 }
 
 /**
- * Whether a stored copy can be adopted without losing anything.
+ * A copy's place in the order: how much conversation it has absorbed, then how
+ * many times it has been published.
  *
- * The version orders writes; it is not proof of content, and it can lag the
- * content it belongs to. A write whose confirmation timed out but which landed
- * anyway leaves this instance holding newer state at an older version — and it
- * would then adopt its own earlier copy back over that state, forgetting a
- * patient it registered or a booking it made.
+ * The message count leads because it is intrinsic — it *is* the content, so it
+ * cannot drift from it. A counter kept alongside the state can: a write whose
+ * confirmation timed out yet landed leaves an instance holding newer state at an
+ * older number, after which ordering by that number alone hands it back its own
+ * earlier copy and it forgets a patient it registered.
  *
- * So the version proposes and the content vetoes: a copy that has fewer
- * messages, or fewer appointments booked, than what we already hold is not an
- * advance whatever it claims. Both lists only ever grow within a run.
+ * Messages are only ever appended, never removed, so the count is monotonic per
+ * run and comparable between instances — where a count of *turns* would not be,
+ * since each instance sees a different subset of them. `rev` breaks the tie for
+ * a publish that changed the session without adding a message.
  */
-function notBehind(
-  restored: { session: Session; messages: ModelMessage[] },
+const versionOf = (copy: { messages: ModelMessage[]; rev: number }) => ({
+  seq: copy.messages.length,
+  rev: copy.rev,
+});
+
+function shouldAdopt(
+  restored: { session: Session; messages: ModelMessage[]; rev: number },
   run: Run,
 ): boolean {
+  // A run rebuilt from visible history knows no patient, and nothing about the
+  // ordering can express how much that costs: booking against it registers the
+  // same person a second time, in a system the evaluator reads directly. So a
+  // stored copy that knows who the patient is always wins over one that does
+  // not, whatever the counts say.
+  if (restored.session.patient && !run.session.patient) return true;
+
+  const theirs = versionOf(restored);
+  const ours = versionOf(run);
+
   return (
-    restored.messages.length >= run.messages.length &&
-    restored.session.booked.length >= run.session.booked.length
+    theirs.seq > ours.seq || (theirs.seq === ours.seq && theirs.rev > ours.rev)
   );
 }
 
@@ -196,28 +207,35 @@ function notBehind(
 export type PersistedRun = {
   session: PersistedSession;
   messages: ModelMessage[];
+  /** Message count, carried so the compare-and-set can read it without parsing. */
   seq: number;
+  rev: number;
 };
 
 /**
- * The run, one version further along, ready to publish.
+ * The run, ready to publish, one revision on.
  *
- * Pure: the run's own version advances only in `publishedRun`, once the write
- * is known to have landed. A version advanced on the strength of a write that
- * failed open would make this instance look fresher than the state it holds,
- * and it would then refuse to adopt the copy that really is newer.
+ * `seq` is not invented here — it is the message count, which this copy already
+ * has. Only `rev` moves, and only far enough to outrank the copy we last saw.
  */
 export function serializeRun(run: Run): PersistedRun {
   return {
     session: serializeSession(run.session),
     messages: run.messages,
-    seq: run.seq + 1,
+    seq: run.messages.length,
+    rev: run.rev + 1,
   };
 }
 
-/** Records that a published version is now this run's own. */
+/**
+ * Records that a published revision is now this run's own.
+ *
+ * Only on a write that landed. Claiming a revision that was refused would make
+ * this instance outrank the copy that beat it, and it would then decline to
+ * adopt that copy — the divergence would be permanent rather than one turn long.
+ */
 export function publishedRun(run: Run, published: PersistedRun) {
-  run.seq = Math.max(run.seq, published.seq);
+  run.rev = Math.max(run.rev, published.rev);
 }
 
 /**
@@ -231,14 +249,16 @@ export function publishedRun(run: Run, published: PersistedRun) {
 const persistedRun = z.object({
   session: z.unknown(),
   messages: z.array(z.object({ role: z.string() }).passthrough()),
-  // Optional so that a run written by the deployment before versioning existed
-  // still restores, as the oldest possible version.
+  // Both optional so a run written by an earlier deployment still restores. The
+  // message count is read from the messages themselves, so a missing `seq`
+  // costs nothing; a missing `rev` reads as the oldest possible revision.
   seq: z.number().optional(),
+  rev: z.number().optional(),
 });
 
 export function deserializeRun(
   raw: unknown,
-): { session: Session; messages: ModelMessage[]; seq: number } | null {
+): { session: Session; messages: ModelMessage[]; rev: number } | null {
   const parsed = persistedRun.safeParse(raw);
   if (!parsed.success) return null;
 
@@ -248,7 +268,7 @@ export function deserializeRun(
   return {
     session,
     messages: parsed.data.messages as ModelMessage[],
-    seq: parsed.data.seq ?? 0,
+    rev: parsed.data.rev ?? 0,
   };
 }
 

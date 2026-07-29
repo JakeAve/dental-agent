@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { CedarRidgeError, type CedarRidgeClient } from '../cedar-ridge';
-import { WIDENED_SEARCH_DAYS } from '../config';
-import { createSession, type Session } from '../session';
-import { addDays, practiceDate } from '../time';
+import { PRACTICE, WIDENED_SEARCH_DAYS } from '../config';
+import { CONFIRM_ATTEMPT_LIMIT, createSession, type Session } from '../session';
+import { addDays, isCalendarDate, practiceDate } from '../time';
 import { appointmentTools } from './appointments';
 
 /**
@@ -298,6 +298,7 @@ describe('a confirmation that was never answered', () => {
       holdId: 'hold-1',
       service: 'D1110',
       startsAtUtc: '2026-08-03T15:00:00Z',
+      attempts: 1,
     };
     session.slotRefs.set('1', { slotId: 'slot-9', startsAtUtc: '2026-08-04T15:00:00Z' });
 
@@ -319,6 +320,7 @@ describe('a confirmation that was never answered', () => {
       holdId: 'hold-1',
       service: 'D1110',
       startsAtUtc: '2026-08-03T15:00:00Z',
+      attempts: 1,
     };
 
     const result = await call(api, session, 'confirmAppointment');
@@ -383,8 +385,10 @@ function fakeSparseApi(openFrom: string) {
 
       // An omitted `to` is not an unbounded window: the API defaults to
       // fourteen days, which is the whole reason an empty first search is worth
-      // retrying wider.
-      const reaches = (params.to ?? addDays(practiceDate(), 14)) >= openFrom;
+      // retrying wider. A `to` this fake cannot read gets the same default,
+      // rather than sorting its way to a wrong answer.
+      const asked = isCalendarDate(params.to) ? params.to : addDays(practiceDate(), 14)!;
+      const reaches = asked >= openFrom;
 
       return {
         availability: reaches ? [slot(1, `${openFrom}T15:00:00Z`)] : [],
@@ -398,10 +402,10 @@ function fakeSparseApi(openFrom: string) {
 }
 
 describe('an empty window widens itself', () => {
-  const wide = addDays(practiceDate(), WIDENED_SEARCH_DAYS);
+  const wide = addDays(practiceDate(), WIDENED_SEARCH_DAYS)!;
 
   it('retries once at the widened window and returns what it finds', async () => {
-    const { api, calls } = fakeSparseApi(addDays(practiceDate(), 40));
+    const { api, calls } = fakeSparseApi(addDays(practiceDate(), 40)!);
     const session = readySession();
 
     const result = await search(api, session, { service: 'D1110' });
@@ -413,13 +417,13 @@ describe('an empty window widens itself', () => {
   });
 
   it('says the times are not from the window that was asked for', async () => {
-    const { api } = fakeSparseApi(addDays(practiceDate(), 40));
+    const { api } = fakeSparseApi(addDays(practiceDate(), 40)!);
     const session = readySession();
 
     const result = await search(api, session, {
       service: 'D1110',
       from: practiceDate(),
-      to: addDays(practiceDate(), 3),
+      to: addDays(practiceDate(), 3)!,
     });
 
     // Offering them as though they were what was asked for is the failure this
@@ -429,13 +433,13 @@ describe('an empty window widens itself', () => {
   });
 
   it('does not widen a window that is already wider', async () => {
-    const { api, calls } = fakeSparseApi(addDays(practiceDate(), 400));
+    const { api, calls } = fakeSparseApi(addDays(practiceDate(), 400)!);
     const session = readySession();
 
     await search(api, session, {
       service: 'D1110',
       from: practiceDate(),
-      to: addDays(practiceDate(), 90),
+      to: addDays(practiceDate(), 90)!,
     });
 
     expect(calls).toHaveLength(1);
@@ -450,19 +454,151 @@ describe('an empty window widens itself', () => {
     expect(calls).toHaveLength(1);
   });
 
-  it('files the refs under the window that actually produced them', async () => {
-    const { api } = fakeSparseApi(addDays(practiceDate(), 40));
+  /**
+   * The next call is almost always "page 2 of that", with the model repeating
+   * the arguments it used before — which are the arguments of the window that
+   * came back empty. Paging that window instead of the one that produced page 1
+   * asks for the second page of a search that had no first page: it returns
+   * nothing, clears every ref the patient is choosing from, and reports that
+   * "the times you already fetched are still on offer" as it deletes them.
+   */
+  it('pages the window that produced the times, not the one that was asked for', async () => {
+    const { api, calls } = fakeSparseApi(addDays(practiceDate(), 40)!);
+    const session = readySession();
+
+    const first = await search(api, session, { service: 'D1110' });
+    const refs = (first.slots as Array<{ ref: string }>).map((s) => s.ref);
+
+    const next = await search(api, session, { service: 'D1110', page: 2 });
+
+    expect(calls.at(-1)).toMatchObject({ from: practiceDate(), to: wide, page: 2 });
+    expect(next.slots).not.toEqual([]);
+    // The refs the patient was offered survive the page turn.
+    expect([...session.slotRefs.keys()]).toEqual(expect.arrayContaining(refs));
+  });
+
+  it('keeps the refs when the same search is repeated verbatim', async () => {
+    const { api } = fakeSparseApi(addDays(practiceDate(), 40)!);
     const session = readySession();
 
     await search(api, session, { service: 'D1110' });
-
-    // Searching that same widened window again must be recognised as the same
-    // search, or the refs the patient is choosing from get cleared underneath
-    // them.
-    expect(session.slotSearch).toBe(`D1110|${practiceDate()}|${wide}`);
-
     const refs = [...session.slotRefs.keys()];
-    await search(api, session, { service: 'D1110', from: practiceDate(), to: wide });
+
+    await search(api, session, { service: 'D1110' });
+
     expect([...session.slotRefs.keys()]).toEqual(refs);
+  });
+
+  it('drops the refs when the patient is sent somewhere genuinely different', async () => {
+    const { api } = fakeSparseApi(addDays(practiceDate(), 40)!);
+    const session = readySession();
+
+    await search(api, session, { service: 'D1110' });
+    await search(api, session, { service: 'D0150' });
+
+    expect(session.slotSearch).toBe('D0150||');
+  });
+
+  it('does not read an unpadded date as the wider window', async () => {
+    // '2026-8-5' sorts before '2026-09-27', so a comparison that trusts the
+    // shape concludes the caller already asked for two months and never widens
+    // — in exactly the scarce case widening exists for.
+    const { api, calls } = fakeSparseApi(addDays(practiceDate(), 40)!);
+    const session = readySession();
+
+    await search(api, session, { service: 'D1110', from: '2026-8-1', to: '2026-8-5' });
+
+    expect(calls).toHaveLength(2);
+  });
+
+  it('survives a date it cannot parse at all, rather than throwing', async () => {
+    const { api } = fakeSparseApi(addDays(practiceDate(), 40)!);
+    const session = readySession();
+
+    const result = await search(api, session, { service: 'D1110', from: 'next Tuesday' });
+
+    // withRecovery rethrows anything that is not a CedarRidgeError, so a
+    // RangeError here is not a recoverable tool result — it is a dead turn.
+    expect(result).toBeDefined();
+  });
+});
+
+describe('a confirmation with no definitive answer', () => {
+  const failing = (status: number, code: 'UNKNOWN' | 'HOLD_ALREADY_USED') =>
+    ({
+      confirmAppointment: async () => {
+        throw new CedarRidgeError(code, 'upstream', status, {});
+      },
+    }) as unknown as CedarRidgeClient;
+
+  it('keeps the marker on a 5xx, which is silence with a status code', async () => {
+    const session = held(readySession());
+
+    await call(failing(504, 'UNKNOWN'), session, 'confirmAppointment');
+
+    // The write may well have been carried out; we simply do not know, which is
+    // the same position a turn killed mid-request leaves us in.
+    expect(session.pendingConfirm?.holdId).toBe('hold-1');
+  });
+
+  it('stops re-sending once it has tried as often as is useful', async () => {
+    const session = readySession();
+    session.pendingConfirm = {
+      holdId: 'hold-1',
+      service: 'D1110',
+      startsAtUtc: '2026-08-03T15:00:00Z',
+      attempts: CONFIRM_ATTEMPT_LIMIT,
+    };
+
+    const api = {
+      confirmAppointment: async () => {
+        throw new Error('should not be called');
+      },
+    } as unknown as CedarRidgeClient;
+
+    const result = await call(api, session, 'confirmAppointment');
+
+    expect(result.ok).toBe(false);
+    expect(String(result.guidance)).toContain(PRACTICE.phone);
+  });
+
+  it('counts the attempts it has made', async () => {
+    const session = held(readySession());
+    const api = failing(503, 'UNKNOWN');
+
+    await call(api, session, 'confirmAppointment');
+    expect(session.pendingConfirm?.attempts).toBe(1);
+
+    await call(api, session, 'confirmAppointment');
+    expect(session.pendingConfirm?.attempts).toBe(2);
+  });
+
+  it('is answered by a booking for that slot, not by any booking at all', async () => {
+    const session = readySession();
+    session.pendingConfirm = {
+      holdId: 'hold-2',
+      service: 'D1110',
+      startsAtUtc: '2026-08-10T15:00:00Z',
+      attempts: 1,
+    };
+    // An earlier appointment, at a different time. It says nothing about the
+    // second booking's outcome, so the guard must still hold.
+    session.booked = [
+      {
+        id: 'a1',
+        service: 'Cleaning',
+        startsAtUtc: '2026-08-03T15:00:00Z',
+        provider: 'Dr Chen',
+        price: 'Self-pay. Patient owes $125.00.',
+      },
+    ];
+    session.slotRefs.set('1', { slotId: 'slot-9', startsAtUtc: '2026-08-11T15:00:00Z' });
+
+    const result = await call(stalledConfirm(), session, 'holdSlot', {
+      ref: '1',
+      service: 'D1110',
+    });
+
+    expect(result.ok).toBe(false);
   });
 });

@@ -150,8 +150,9 @@ desk over a preference you could simply ask about.
 
 **No openings does not mean no openings.** New patients need much longer visits,
 so a two-week search can legitimately come back empty when the schedule is not
-full. Always widen the window to 30–60 days before telling anyone there is
-nothing available.
+full. An empty window is widened automatically before you see the result, so
+"nothing open" from the tool has already been checked against a two-month
+window — read what it tells you rather than searching again.
 
 **One search is not the whole schedule.** Availability comes back ten slots at a
 time, earliest first, so the first page of a two-week window often reaches only a

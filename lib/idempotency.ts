@@ -74,7 +74,11 @@ const lockKey = (runId: string, turnId: string) => `dental-agent:lock:${runId}:$
 const runKey = (runId: string) => `dental-agent:run:${runId}`;
 
 /**
- * Write the run only if it is newer than the stored copy. Returns 1 or 0.
+ * Write the run only if it is ahead of the stored copy. Returns 1 or 0.
+ *
+ * Ordered on the message count first and the revision second, the same pair
+ * run-store compares — the count because it is the content itself, the revision
+ * for a publish that changed the session without adding a message.
  *
  * Server-side because the check and the write have to be one step. Reading the
  * version in the route and writing it here leaves a gap wide enough for the
@@ -90,12 +94,16 @@ const CAS_RUN = `
 local raw = redis.call('GET', KEYS[1])
 if raw then
   local ok, current = pcall(cjson.decode, raw)
-  if ok and type(current) == 'table' and tonumber(current.seq) ~= nil
-     and tonumber(current.seq) >= tonumber(ARGV[2]) then
-    return 0
+  if ok and type(current) == 'table' then
+    local seq = tonumber(current.seq)
+    local rev = tonumber(current.rev) or 0
+    if seq ~= nil then
+      if seq > tonumber(ARGV[2]) then return 0 end
+      if seq == tonumber(ARGV[2]) and rev >= tonumber(ARGV[3]) then return 0 end
+    end
   end
 end
-redis.call('SET', KEYS[1], ARGV[1], 'PX', tonumber(ARGV[3]))
+redis.call('SET', KEYS[1], ARGV[1], 'PX', tonumber(ARGV[4]))
 return 1
 `;
 
@@ -226,6 +234,7 @@ export function createSharedStore(
           redis.eval<number>(CAS_RUN, [runKey(runId)], [
             body,
             run.seq,
+            run.rev,
             RUN_TTL_MS,
           ]),
         );
@@ -234,7 +243,8 @@ export function createSharedStore(
           // Not an error: another instance is further along than we are. Its
           // copy stands, and ours is the one that was behind.
           console.warn(
-            `[idempotency] saveRun skipped: stored run is at or past seq ${run.seq}`,
+            '[idempotency] saveRun skipped: stored run is at or past ' +
+              `seq ${run.seq} rev ${run.rev}`,
           );
         }
 

@@ -1,9 +1,20 @@
 import { tool } from 'ai';
 import { z } from 'zod';
 import { CedarRidgeError, type Appointment, type CedarRidgeClient } from '../cedar-ridge';
-import { WIDENED_SEARCH_DAYS } from '../config';
-import { insuranceBlocks, type Session } from '../session';
-import { addDays, partOfDay, practiceDate, toPracticeTime } from '../time';
+import { PRACTICE, WIDENED_SEARCH_DAYS } from '../config';
+import {
+  CONFIRM_ATTEMPT_LIMIT,
+  insuranceBlocks,
+  unresolvedConfirm,
+  type Session,
+} from '../session';
+import {
+  addDays,
+  isCalendarDate,
+  partOfDay,
+  practiceDate,
+  toPracticeTime,
+} from '../time';
 import { withRecovery } from './errors';
 
 /** Money comes back from the API in cents; never let the model divide. */
@@ -39,14 +50,24 @@ function summarize(appt: Appointment) {
 }
 
 /**
+ * True when a failed confirm tells us where the booking actually stands.
+ *
+ * A 409 or a 410 does: the hold was consumed, superseded or lapsed, and the
+ * conversation can move on — which S27 and S28 both depend on, since an
+ * expected error there must not lock the agent out of booking the slot the
+ * patient chose. A 5xx does not. Nor does a body this client cannot read: both
+ * mean the request may well have been carried out and we simply do not know,
+ * which is the same position a turn killed mid-request leaves us in.
+ */
+const definitive = (err: unknown) =>
+  err instanceof CedarRidgeError && err.status < 500 && err.code !== 'UNKNOWN';
+
+/**
  * Confirms a hold, and settles the record of whether it was ever answered.
  *
- * Any reply resolves that question, an error included: a 409 or a 410 is the
- * API telling us where it stands, and the ambiguity worth guarding against is
- * silence — a turn killed by its deadline mid-request. So the pending marker is
- * cleared on both paths here, and left standing only when nothing came back at
- * all. Without that distinction, an expected 409 on a superseded hold would
- * lock the conversation out of booking the slot the patient actually chose.
+ * The marker is cleared on success and on a definitive refusal, and left
+ * standing when the outcome is genuinely unknown. Silence is the case it exists
+ * for, but a gateway timeout is silence with a status code attached.
  */
 async function confirmed(
   api: CedarRidgeClient,
@@ -59,7 +80,7 @@ async function confirmed(
     session.pendingConfirm = undefined;
     return appt;
   } catch (err) {
-    if (err instanceof CedarRidgeError) session.pendingConfirm = undefined;
+    if (definitive(err)) session.pendingConfirm = undefined;
     throw err;
   }
 }
@@ -139,9 +160,22 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
               page,
             });
 
-          let result = await search({ from, to });
-          let searched = { from, to };
-          let widened = false;
+          // Keyed on what the model asked for, because that is what it repeats
+          // when it asks for the next page. Paging within one search accumulates
+          // refs; a genuinely different search discards them, since the patient
+          // is no longer being offered those times.
+          const searchKey = `${service}|${from ?? ''}|${to ?? ''}`;
+          const continuing = session.slotSearch === searchKey;
+
+          // Page 2 of a search that widened itself has to page the window that
+          // produced page 1. Asking the requested window for page 2 asks for the
+          // second page of a window that had no first one — which came back
+          // empty, cleared every ref the patient was choosing from, and reported
+          // "the times you already fetched are still on offer" while they were
+          // being deleted.
+          let searched = continuing ? (session.slotWindow ?? { from, to }) : { from, to };
+          let result = await search(searched);
+          let widened = continuing && searched.from !== from;
 
           // An empty first page used to be answered with a paragraph asking the
           // model to search again over 30 to 60 days. It usually did. "Usually"
@@ -149,29 +183,25 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
           // practice is full when it has openings all month, and one extra call
           // buys the certainty. Only from the first page, because a later page
           // coming back empty means the window ran out of pages, not of days.
-          if (result.availability.length === 0 && (page ?? 1) === 1) {
-            const wideFrom = from ?? practiceDate();
+          if (result.availability.length === 0 && (page ?? 1) === 1 && !continuing) {
+            const wideFrom = isCalendarDate(from) ? from : practiceDate();
             const wideTo = addDays(wideFrom, WIDENED_SEARCH_DAYS);
 
-            // Skipped when the caller already asked for at least this much: a
-            // repeat of the same search would spend a call to learn nothing.
-            if (!to || to < wideTo) {
+            // Skipped when the caller already asked to look at least that far.
+            // Compared only between well-formed dates: "2026-8-5" sorts before
+            // "2026-09-27" and would read as the wider window of the two.
+            const alreadyWide = isCalendarDate(to) && wideTo !== undefined && to >= wideTo;
+
+            if (wideTo && !alreadyWide) {
               widened = true;
               searched = { from: wideFrom, to: wideTo };
               result = await search(searched);
             }
           }
 
-          // Paging within one search accumulates refs; changing the search
-          // discards them, because the patient is no longer being offered those
-          // times. Keyed on the window actually searched, not the one asked
-          // for, or a widened search's refs would be filed under a window that
-          // never produced them.
-          const searchKey = `${service}|${searched.from ?? ''}|${searched.to ?? ''}`;
-          if (session.slotSearch !== searchKey) {
-            slotRefs.clear();
-            session.slotSearch = searchKey;
-          }
+          if (!continuing) slotRefs.clear();
+          session.slotSearch = searchKey;
+          session.slotWindow = searched;
 
           const pagesLeft = result.total_pages - result.page;
 
@@ -186,21 +216,28 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
               searchedTo: searched.to ?? '14 days out (the default)',
               widenedTo: widened ? `${WIDENED_SEARCH_DAYS} days` : undefined,
               guidance:
-                // An empty first page means an empty window whatever the page
-                // count says; only a later page can have run off the end.
-                result.page > 1 && result.page > result.total_pages
-                  ? `There is no page ${result.page} — this search has ` +
-                    `${result.total_pages}. The times you already fetched are ` +
-                    'still on offer; go back to an earlier page, or search a ' +
-                    'different window.'
+                // Three different dead ends, and conflating them is how the
+                // agent came to tell patients a month was full.
+                result.page > 1
+                  ? // A later page. Whether it ran off the end of the count or
+                    // its slots were taken since, the earlier pages of this
+                    // search still hold real times — so this is never grounds
+                    // for telling the patient there is nothing.
+                    `Page ${result.page} of this search has nothing on it (it ` +
+                    `reports ${result.total_pages} page(s)). The times from the ` +
+                    'pages you already fetched are still on offer and their refs ' +
+                    'are still good. Go back to those, or search a different ' +
+                    'window — do NOT tell the patient there is no availability.'
                   : widened
-                    ? `Nothing open in the next ${WIDENED_SEARCH_DAYS} days — ` +
-                      'this search was already widened to that automatically, so ' +
-                      'widening again will return the same nothing. This is a ' +
-                      'real dead end: say so, and offer the office number.'
-                    : 'Nothing open in that window, and it was not widened ' +
-                      'because you asked for a wider one already. Say so plainly ' +
-                      'rather than searching it again.',
+                    ? `Nothing open in the next ${WIDENED_SEARCH_DAYS} days. ` +
+                      'This search was already widened to that automatically, so ' +
+                      'searching wider will return the same nothing. That makes ' +
+                      'it a real dead end: say so, and give them the office ' +
+                      `number, ${PRACTICE.phone}.`
+                    : 'Nothing open in the window that was searched, and it was ' +
+                      'not widened — you asked to look at least ' +
+                      `${WIDENED_SEARCH_DAYS} days out already. Tell the patient ` +
+                      'plainly rather than repeating the same search.',
             };
           }
 
@@ -281,16 +318,24 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
           // Refused rather than discouraged. A hold taken while a submitted
           // booking's outcome is unknown is the first step of a duplicate
           // booking, and prompt wording is not a guarantee — this is.
-          if (session.pendingConfirm && !session.booked.length) {
+          const outstanding = unresolvedConfirm(session);
+
+          if (outstanding) {
             return {
               ok: false as const,
               problem:
                 'A booking was already submitted for this patient and its ' +
                 'outcome is still unknown.',
               guidance:
-                'Call confirmAppointment first. Confirming the same hold twice ' +
-                'is safe and returns the existing appointment if there is one. ' +
-                'Holding another slot now risks booking this patient twice.',
+                outstanding.attempts >= CONFIRM_ATTEMPT_LIMIT
+                  ? 'It has been re-sent as many times as is useful and still ' +
+                    'will not answer, so it may exist. Do not book over it: ' +
+                    'tell the patient you cannot confirm it and give them the ' +
+                    `office number, ${PRACTICE.phone}.`
+                  : 'Call confirmAppointment first. Confirming the same hold ' +
+                    'twice is safe and returns the existing appointment if ' +
+                    'there is one. Holding another slot now risks booking this ' +
+                    'patient twice.',
             };
           }
 
@@ -350,7 +395,25 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
           // to confirm even when the hold is gone or looks lapsed: re-sending
           // it is the only way to find out whether it exists, and the API
           // documents that as safe.
-          const target = session.hold ?? session.pendingConfirm;
+          // The outstanding confirmation wins over a hold, so that re-sending
+          // it cannot overwrite the one id that can still resolve it.
+          const outstanding = unresolvedConfirm(session);
+          const target = outstanding ?? session.hold ?? session.pendingConfirm;
+
+          if (outstanding && outstanding.attempts >= CONFIRM_ATTEMPT_LIMIT) {
+            return {
+              ok: false as const,
+              problem:
+                `That booking has been submitted ${outstanding.attempts} times ` +
+                'and has never answered.',
+              guidance:
+                'Stop re-sending it — the answer is not coming, and the ' +
+                'appointment may well exist. Tell the patient you are not able ' +
+                'to confirm it from here, give them the office number ' +
+                `${PRACTICE.phone} so the front desk can check, and do not ` +
+                'book anything else for them. Never tell them nothing was booked.',
+            };
+          }
 
           if (!target) {
             return {
@@ -369,6 +432,7 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
             holdId: target.holdId,
             service: target.service,
             startsAtUtc: target.startsAtUtc,
+            attempts: (outstanding?.attempts ?? 0) + 1,
           };
 
           const appt = await confirmed(api, target.holdId, notes, session);

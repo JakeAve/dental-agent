@@ -46,16 +46,35 @@ export function practiceDate(now = new Date()): string {
 }
 
 /**
+ * True for a zero-padded YYYY-MM-DD and nothing else.
+ *
+ * Worth checking rather than assuming, because these dates come from a model:
+ * "2026-8-5" reads as a date to a person and sorts before "2026-09-27" to a
+ * computer, so a comparison that trusts the shape quietly draws the wrong
+ * conclusion about which window is wider.
+ */
+export const isCalendarDate = (value: string | undefined): value is string =>
+  value !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(value);
+
+/**
  * A calendar day some days after another, as YYYY-MM-DD.
  *
  * Plain arithmetic on a date with no time and no zone: the practice's calendar
  * does not shift because a clock did, and a window that lands a day out because
  * of a daylight-saving boundary is a window that misses a real opening.
+ *
+ * Undefined for anything that is not already a calendar date, rather than
+ * throwing on it — this is called with model-supplied values, and a RangeError
+ * out of `toISOString` is not a recoverable tool result, it is a dead turn.
  */
-export function addDays(isoDate: string, days: number): string {
+export function addDays(isoDate: string, days: number): string | undefined {
+  if (!isCalendarDate(isoDate)) return undefined;
+
   const [year, month, day] = isoDate.split('-').map(Number);
   const shifted = new Date(Date.UTC(year, month - 1, day + days));
-  return shifted.toISOString().slice(0, 10);
+  return Number.isNaN(shifted.getTime())
+    ? undefined
+    : shifted.toISOString().slice(0, 10);
 }
 
 /** "Wednesday, August 5, 2026 at 3:30 PM MDT" */

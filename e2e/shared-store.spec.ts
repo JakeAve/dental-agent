@@ -18,8 +18,9 @@ import { sharedStoreFromEnv } from '../lib/idempotency';
 
 const store = sharedStoreFromEnv();
 
-const run = (seq: number, patientId: string) => ({
+const run = (seq: number, patientId: string, rev = 1) => ({
   seq,
+  rev,
   session: {
     patient: { id: patientId, name: 'Dana Reed', status: 'returning' as const },
     slotRefs: [] as Array<[string, { slotId: string; startsAtUtc: string }]>,

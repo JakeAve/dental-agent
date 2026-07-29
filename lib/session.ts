@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { PRACTICE } from './config';
 import { toPracticeTime } from './time';
 
 /**
@@ -50,6 +51,16 @@ export type Session = {
    * point at times no longer on offer.
    */
   slotSearch?: string;
+  /**
+   * The window the current refs actually came from.
+   *
+   * Not always the window that was asked for: an empty search widens itself, so
+   * the times on offer can come from sixty days when fourteen were requested.
+   * Kept because the *next* call is usually "page 2 of that" with the original
+   * arguments repeated — and paging the requested window instead of the searched
+   * one asks for page 2 of a window that had no page 1.
+   */
+  slotWindow?: { from?: string; to?: string };
   /** The most recent hold. Holds expire after five minutes. */
   hold?: {
     holdId: string;
@@ -79,6 +90,13 @@ export type Session = {
     holdId: string;
     service: string;
     startsAtUtc: string;
+    /**
+     * How many times it has been sent. Bounded because the alternative is a
+     * conversation that spends one metered call per turn insisting on a
+     * confirmation that will never answer — a response the client cannot parse
+     * fails the same way every time — while the patient hears only an apology.
+     */
+    attempts: number;
   };
   booked: Array<{
     id: string;
@@ -96,6 +114,28 @@ export const createSession = (): Session => ({
   booked: [],
   resolved: false,
 });
+
+/** How many times a confirmation may be re-sent before handing off. */
+export const CONFIRM_ATTEMPT_LIMIT = 3;
+
+/**
+ * A submitted booking whose outcome is still unknown.
+ *
+ * Not merely "the marker is set": a marker for a slot that is already in
+ * `booked` has been answered, and the conversation is free to carry on. Checked
+ * against the slot rather than against the count, because a patient booking a
+ * second appointment would otherwise be unprotected by the very guard that
+ * exists for the first.
+ */
+export function unresolvedConfirm(session: Session) {
+  const pending = session.pendingConfirm;
+  if (!pending) return undefined;
+
+  const answered = session.booked.some(
+    (b) => b.startsAtUtc === pending.startsAtUtc,
+  );
+  return answered ? undefined : pending;
+}
 
 /**
  * True when this patient may not search availability yet.
@@ -149,6 +189,9 @@ const persistedSession = z.object({
     z.tuple([z.string(), z.object({ slotId: z.string(), startsAtUtc: z.string() })]),
   ),
   slotSearch: z.string().optional(),
+  slotWindow: z
+    .object({ from: z.string().optional(), to: z.string().optional() })
+    .optional(),
   hold: z
     .object({
       holdId: z.string(),
@@ -163,6 +206,7 @@ const persistedSession = z.object({
       holdId: z.string(),
       service: z.string(),
       startsAtUtc: z.string(),
+      attempts: z.number().default(0),
     })
     .optional(),
   booked: z.array(
@@ -194,6 +238,7 @@ export function serializeSession(session: Session): PersistedSession {
     insurance: session.insurance,
     slotRefs: [...session.slotRefs],
     slotSearch: session.slotSearch,
+    slotWindow: session.slotWindow,
     hold: session.hold,
     pendingConfirm: session.pendingConfirm,
     booked: session.booked,
@@ -334,20 +379,30 @@ export function describeSession(session: Session, now = new Date()): string {
 
   // Before the hold, and instead of it: an unanswered confirmation is the one
   // state where "take a fresh hold" is the wrong move, so it must not be read
-  // after a line that says to.
-  if (session.pendingConfirm && !session.booked.length) {
+  // after a line that says to — nor alongside it, which is why the hold line is
+  // skipped entirely while this stands.
+  const pending = unresolvedConfirm(session);
+
+  if (pending) {
     lines.push(
-      `A booking for ${toPracticeTime(session.pendingConfirm.startsAtUtc)} was ` +
-        'already submitted and the answer never came back, so it may or may ' +
-        'not exist. Call confirmAppointment again NOW, before anything else: ' +
-        'sending the same hold twice is safe and returns the appointment if it ' +
-        'was created. Do NOT search times, do NOT take another hold, and do ' +
-        'NOT tell the patient anything about their appointment until it ' +
-        'answers — a second booking is far worse than a slow one.',
+      pending.attempts >= CONFIRM_ATTEMPT_LIMIT
+        ? `A booking for ${toPracticeTime(pending.startsAtUtc)} was submitted ` +
+          `${pending.attempts} times and never answered, so it cannot be ` +
+          'confirmed from here and it may well exist. Stop trying. Tell the ' +
+          'patient you are not able to confirm it and give them the office ' +
+          `number, ${PRACTICE.phone}, so the front desk can check. Do not ` +
+          'book anything else for them, and never say they have no appointment.'
+        : `A booking for ${toPracticeTime(pending.startsAtUtc)} was already ` +
+          'submitted and the answer never came back, so it may or may not ' +
+          'exist. Call confirmAppointment again NOW, before anything else: ' +
+          'sending the same hold twice is safe and returns the appointment if ' +
+          'it was created. Do NOT search times, do NOT take another hold, and ' +
+          'do NOT tell the patient anything about their appointment until it ' +
+          'answers — a second booking is far worse than a slow one.',
     );
   }
 
-  if (session.hold) {
+  if (session.hold && !pending) {
     const secondsLeft = Math.round((session.hold.expiresAtMs - now.getTime()) / 1000);
 
     lines.push(

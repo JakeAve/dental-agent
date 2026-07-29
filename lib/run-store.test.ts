@@ -94,12 +94,13 @@ describe('getRun', () => {
     const run = getRun('r1', HISTORY);
     run.session.patient = { id: 'live', name: 'Dana Reed', status: 'returning' };
     // This process has absorbed a turn the stored copy has not.
-    run.seq = 2;
+    run.messages.push({ role: 'assistant', content: 'Verifying your insurance.' });
 
     const kept = getRun('r1', HISTORY, {
       seq: 1,
+      rev: 1,
       session: stored({ id: 'older', name: 'X', status: 'new' }),
-      messages: [],
+      messages: [{ role: 'user', content: 'I need a cleaning.' }],
     });
 
     expect(kept.session.patient?.id).toBe('live');
@@ -117,7 +118,8 @@ describe('getRun', () => {
     run.turns.set('t1', { message: 'Booked.', status: 'complete' });
 
     const adopted = getRun('r1', HISTORY, {
-      seq: 3,
+      seq: 4,
+      rev: 3,
       session: stored({ id: 'p1', name: 'Dana Reed', status: 'returning' }, true),
       messages: [
         ...HISTORY.map((h) => ({
@@ -130,37 +132,50 @@ describe('getRun', () => {
     });
 
     expect(adopted.session.booked).toHaveLength(1);
-    expect(adopted.seq).toBe(3);
+    expect(adopted.rev).toBe(3);
     // Adopted in place: the turn maps are this process's own idempotency
     // record and must not be thrown away with the state.
     expect(adopted.turns.get('t1')?.status).toBe('complete');
   });
 
-  /**
-   * A stored copy this build cannot read lends nothing, least of all its place
-   * in the order. Taking its version would let a history-only session — no
-   * patient, no hold, no booking — outrank the real state and be adopted by the
-   * instances still holding it, turning one parse failure into a lost run.
-   */
-  it('claims no version from a stored copy it cannot read', () => {
-    const run = getRun('r1', HISTORY, { seq: 7, session: 'corrupt', messages: [] });
+  it('claims no revision from a stored copy it cannot read', () => {
+    const run = getRun('r1', HISTORY, { seq: 7, rev: 7, session: 'corrupt', messages: [] });
 
     expect(run.session.patient).toBeUndefined();
-    expect(run.seq).toBe(0);
-    // And so its write is the one the store refuses, not the other way round.
-    expect(serializeRun(run).seq).toBeLessThan(7);
+    expect(run.rev).toBe(0);
   });
 
   /**
-   * The version orders writes but does not prove content, and it can lag the
-   * content it belongs to: a write whose confirmation timed out yet landed
-   * leaves this instance newer than its own published version. Adopting on the
-   * version alone would then hand back its own earlier copy and forget the
-   * booking it had just made.
+   * The revision counter can lag the content it belongs to — a write whose
+   * confirmation timed out yet landed leaves this instance newer than its own
+   * published revision. Ordering on that counter alone would hand it back its
+   * own earlier copy and forget the booking it had just made, which is why the
+   * message count leads: it is the content rather than a claim about it.
    */
-  it('refuses to adopt a copy that holds less than it does', () => {
+  it('refuses a copy with a higher revision but less conversation', () => {
     const run = getRun('r1', HISTORY);
     run.session.patient = { id: 'p1', name: 'Dana Reed', status: 'returning' };
+    run.messages.push({ role: 'assistant', content: 'Booked.' });
+
+    const kept = getRun('r1', HISTORY, {
+      seq: 1,
+      rev: 99,
+      session: stored({ id: 'p1', name: 'Dana Reed', status: 'returning' }),
+      messages: [{ role: 'user', content: 'I need a cleaning.' }],
+    });
+
+    expect(kept.messages).toHaveLength(3);
+  });
+
+  /**
+   * `booked` is the one list that shrinks: cancelling filters it. An ordering
+   * that treated a shorter list as proof of staleness would refuse the very
+   * instance that did the cancelling, leave this one calling a dead appointment
+   * live, and — because its own writes would then be refused too — never
+   * reconcile for the rest of the run.
+   */
+  it('adopts a cancellation, which leaves fewer bookings than before', () => {
+    const run = getRun('r1', HISTORY);
     run.session.booked = [
       {
         id: 'a1',
@@ -170,32 +185,58 @@ describe('getRun', () => {
         price: 'Self-pay. Patient owes $125.00.',
       },
     ];
-    run.messages.push({ role: 'assistant', content: 'Booked.' });
 
-    const kept = getRun('r1', HISTORY, {
-      // Higher version, but it is our own earlier copy: no booking, one message
-      // fewer. An advance in name only.
-      seq: 99,
+    const adopted = getRun('r1', HISTORY, {
+      seq: 5,
+      rev: 5,
+      session: stored({ id: 'p1', name: 'Dana Reed', status: 'returning' }),
+      messages: [
+        { role: 'user', content: 'I need a cleaning.' },
+        { role: 'assistant', content: 'Are you a new or returning patient?' },
+        { role: 'user', content: 'actually cancel it' },
+        { role: 'assistant', content: 'Cancelled.' },
+        { role: 'user', content: 'thanks' },
+      ],
+    });
+
+    expect(adopted.session.booked).toHaveLength(0);
+  });
+
+  /**
+   * A run rebuilt from visible history knows no patient, and no count can
+   * express what that costs: booking against it registers the same person
+   * twice. A long history could otherwise outnumber a short stored run.
+   */
+  it('takes a stored copy that knows the patient over one that does not', () => {
+    const long = Array.from({ length: 20 }, (_, i) => ({
+      role: i % 2 ? ('agent' as const) : ('patient' as const),
+      content: `line ${i}`,
+    }));
+    getRun('r1', long);
+
+    const adopted = getRun('r1', long, {
+      seq: 2,
+      rev: 1,
       session: stored({ id: 'p1', name: 'Dana Reed', status: 'returning' }),
       messages: [{ role: 'user', content: 'I need a cleaning.' }],
     });
 
-    expect(kept.session.booked).toHaveLength(1);
-    expect(kept.messages).toHaveLength(3);
+    expect(adopted.session.patient?.id).toBe('p1');
   });
 
-  it('advances its version only once a publish has landed', () => {
+  it('advances its revision only once a publish has landed', () => {
     const run = getRun('r1', HISTORY);
     const published = serializeRun(run);
 
-    // Serializing is not publishing: a write that failed open must not leave
-    // this instance looking fresher than the state it actually holds, or it
-    // will refuse the copy that really is newer.
-    expect(run.seq).toBe(0);
-    expect(published.seq).toBe(1);
+    // Serializing is not publishing. Claiming a revision that was refused would
+    // make this instance outrank the copy that beat it, and it would then
+    // decline to adopt that copy — a permanent split rather than a one-turn one.
+    expect(run.rev).toBe(0);
+    expect(published.rev).toBe(1);
+    expect(published.seq).toBe(run.messages.length);
 
     publishedRun(run, published);
-    expect(run.seq).toBe(1);
+    expect(run.rev).toBe(1);
   });
 });
 
