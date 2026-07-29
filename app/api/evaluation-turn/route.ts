@@ -160,10 +160,14 @@ export async function POST(req: Request) {
   const deadline = setTimeout(() => control.abort(), TURN_DEADLINE_MS);
 
   const work = (async (): Promise<Turn> => {
-    run.messages.push({ role: 'user', content: input.message });
+    // Built beside the run rather than pushed into it. A turn that fails must
+    // leave `run.messages` exactly as it found it: appending the patient's line
+    // up front means a retry of a failed turn appends it a second time, and the
+    // model then answers a question it can see asked twice.
+    const messages = [...run.messages, { role: 'user' as const, content: input.message }];
 
     const result = await runAgentOnce({
-      messages: run.messages,
+      messages,
       client: createClient({
         baseUrl: base_url,
         apiKey: api_key,
@@ -173,10 +177,10 @@ export async function POST(req: Request) {
       abortSignal: control.signal,
     });
 
-    // Feed the full step history — including tool calls and their results —
-    // back into the run, so later turns keep the patientId and the slots we
-    // already paid to fetch.
-    run.messages.push(...result.response.messages);
+    // Committed only now that the turn has produced something: the full step
+    // history, tool calls and results included, so later turns keep the
+    // patientId and the slots we already paid to fetch.
+    run.messages = [...messages, ...result.response.messages];
 
     // Tool names only — never arguments, which carry patient data and could
     // carry the key. Without this it is impossible to tell a real booking from
@@ -239,9 +243,24 @@ export async function POST(req: Request) {
       err instanceof Error ? err.message : 'unknown error',
     );
     turn = { message: FALLBACK, status: 'continue' };
-    // Not cached, and the claim is freed — a retry of a timed-out turn
-    // deserves a real attempt, on whichever instance it lands.
-    if (shared) await shared.releaseTurn(run_id, turn_id);
+
+    // The fallback is deliberately not saved as this turn's answer: a retry of
+    // a timed-out turn deserves a real attempt rather than a permanent apology,
+    // so the claim is freed and the turn may run again on whichever instance it
+    // lands.
+    //
+    // What must not happen is that second attempt acting as though the first
+    // never touched anything. A deadline can fire after confirmAppointment
+    // returned — the booking exists, the patient just never heard about it —
+    // and the tools mutate the session as they go, so the session is the record
+    // of what actually happened. Publishing it before releasing the claim is
+    // what makes the retry idempotent: it opens with "already booked in this
+    // conversation" instead of booking a second appointment. Order matters, and
+    // it costs one round trip on a path that has already given up on speed.
+    if (shared) {
+      await shared.saveRun(run_id, serializeRun(run));
+      await shared.releaseTurn(run_id, turn_id);
+    }
   } finally {
     // Both matter: an un-cleared timer would abort a client that finished in
     // time (harmless here, but it keeps the process alive), and a live entry
