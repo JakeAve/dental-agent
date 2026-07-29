@@ -2,8 +2,8 @@ import { z } from 'zod';
 import { runAgentOnce } from '@/lib/agent';
 import { createClient } from '@/lib/cedar-ridge';
 import { PRACTICE, PROTOCOL_VERSION, TURN_DEADLINE_MS } from '@/lib/config';
-import { turnStoreFromEnv } from '@/lib/idempotency';
-import { getRun, type Turn } from '@/lib/run-store';
+import { sharedStoreFromEnv } from '@/lib/idempotency';
+import { getRun, peekRun, serializeRun, type Turn } from '@/lib/run-store';
 import { collapseRestartedReply } from '@/lib/reply';
 
 /**
@@ -97,34 +97,37 @@ export async function POST(req: Request) {
   const { run_id, turn_id, input, resources, protocol_version } = parsed.data;
   const { base_url, api_key } = resources.dental_api;
 
-  const run = getRun(run_id, input.history);
+  // Idempotency, in layers, cheapest first: a turn this process already
+  // answered replays verbatim, and a retry that races the original awaits it
+  // instead of acting twice.
+  const local = peekRun(run_id);
+  if (local) {
+    const done = local.turns.get(turn_id);
+    if (done) return reply(envelope(protocol_version, run_id, turn_id, done));
 
-  // Idempotency, in two layers: a turn we already answered replays verbatim,
-  // and a retry that races the original awaits it instead of acting twice.
-  const done = run.turns.get(turn_id);
-  if (done) return reply(envelope(protocol_version, run_id, turn_id, done));
-
-  const racing = run.inFlight.get(turn_id);
-  if (racing) {
-    return reply(envelope(protocol_version, run_id, turn_id, await racing));
+    const racing = local.inFlight.get(turn_id);
+    if (racing) {
+      return reply(envelope(protocol_version, run_id, turn_id, await racing));
+    }
   }
 
-  // Third layer, across instances: the maps above are per-process, and Vercel
-  // routes retries wherever it likes — a replay landing on a fresh instance
-  // would sail past both and act twice. With Redis configured, exactly one
-  // instance claims each turn; the rest replay its saved result or wait for it.
-  const shared = turnStoreFromEnv();
+  // Then across instances: the maps above are per-process, and Vercel routes
+  // retries wherever it likes — a replay landing on a fresh instance would sail
+  // past both and act twice. With Redis configured, exactly one instance claims
+  // each turn; the rest replay its saved result or wait for it.
+  const shared = sharedStoreFromEnv();
   if (shared) {
     const settled = await shared.getTurn(run_id, turn_id);
     if (settled) {
-      run.turns.set(turn_id, settled);
+      // Not cached locally on purpose: this instance may hold no run at all,
+      // and a run built here just to hold one turn would shadow the fuller
+      // state the next turn restores from the shared store.
       return reply(envelope(protocol_version, run_id, turn_id, settled));
     }
 
     if (!(await shared.claimTurn(run_id, turn_id))) {
       // Another instance is executing this turn right now.
       const won = await shared.awaitTurn(run_id, turn_id);
-      if (won) run.turns.set(turn_id, won);
       return reply(
         envelope(
           protocol_version,
@@ -135,6 +138,14 @@ export async function POST(req: Request) {
       );
     }
   }
+
+  // This instance owns the turn. Materialise the run — restoring what earlier
+  // turns established if we have never seen this one, because visible history
+  // alone would lose the patient id, the offered slots and any live hold, and
+  // an agent that cannot see its own patient record registers a second one.
+  const run =
+    local ??
+    getRun(run_id, input.history, shared ? await shared.loadRun(run_id) : undefined);
 
   /**
    * The turn's kill switch.
@@ -209,7 +220,16 @@ export async function POST(req: Request) {
     // Publish before responding, so a retry that races the response cannot
     // land on another instance ahead of the saved turn. The claim lock stays:
     // releasing it here would let a late retry claim and re-run a finished turn.
-    if (shared) await shared.saveTurn(run_id, turn_id, turn);
+    //
+    // Run state first, deliberately. If the process dies between these two
+    // writes, a saved run without a saved turn means a retry re-runs the turn
+    // already knowing what it did — which describeSession turns into "do not
+    // book a second appointment". The reverse order would leave the next turn
+    // restoring a run that has forgotten this turn's patient id.
+    if (shared) {
+      await shared.saveRun(run_id, serializeRun(run));
+      await shared.saveTurn(run_id, turn_id, turn);
+    }
   } catch (err) {
     // Deliberately no error detail in the response: the key travels in this
     // request, and a leaked message is a scored failure.

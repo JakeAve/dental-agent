@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { toPracticeTime } from './time';
 
 /**
@@ -89,6 +90,96 @@ export function insuranceBlocks(session: Session): boolean {
     status === 'invalid_member' ||
     status === 'not_accepted'
   );
+}
+
+/* ------------------------------------------------------------------ *
+ * Persistence
+ * ------------------------------------------------------------------ */
+
+const persistedSession = z.object({
+  patient: z
+    .object({
+      id: z.string(),
+      name: z.string(),
+      status: z.enum(['new', 'returning']),
+    })
+    .optional(),
+  insurance: z
+    .object({
+      status: z.enum([
+        'unverified',
+        'active',
+        'not_accepted',
+        'invalid_member',
+        'self_pay',
+      ]),
+      planName: z.string().optional(),
+      coveredCodes: z.array(z.string()).optional(),
+    })
+    .optional(),
+  slotRefs: z.array(
+    z.tuple([z.string(), z.object({ slotId: z.string(), startsAtUtc: z.string() })]),
+  ),
+  slotSearch: z.string().optional(),
+  hold: z
+    .object({
+      holdId: z.string(),
+      slotId: z.string(),
+      service: z.string(),
+      startsAtUtc: z.string(),
+      expiresAtMs: z.number(),
+    })
+    .optional(),
+  booked: z.array(
+    z.object({
+      id: z.string(),
+      service: z.string(),
+      startsAtUtc: z.string(),
+      provider: z.string(),
+      price: z.string(),
+    }),
+  ),
+  resolved: z.boolean(),
+});
+
+/**
+ * The session in a form Redis can hold.
+ *
+ * Only `slotRefs` needs converting — a Map does not survive JSON. `expiresAtMs`
+ * travels as-is on purpose: it is absolute epoch milliseconds, so it means the
+ * same thing on the instance that reads it as on the one that wrote it. The
+ * hold, being a five-minute reservation held by the API rather than by us,
+ * remains valid across that move.
+ */
+export type PersistedSession = z.infer<typeof persistedSession>;
+
+export function serializeSession(session: Session): PersistedSession {
+  return {
+    patient: session.patient,
+    insurance: session.insurance,
+    slotRefs: [...session.slotRefs],
+    slotSearch: session.slotSearch,
+    hold: session.hold,
+    booked: session.booked,
+    resolved: session.resolved,
+  };
+}
+
+/**
+ * A stored session, or null if it cannot be trusted.
+ *
+ * Validated rather than cast because the writer may be a different deployment:
+ * a shape change mid-evaluation would otherwise hand the tools a session whose
+ * fields are quietly missing. A null here costs the turn its accumulated state,
+ * which is bad; running on a malformed session risks a duplicate patient
+ * record, which is worse.
+ */
+export function deserializeSession(raw: unknown): Session | null {
+  const parsed = persistedSession.safeParse(raw);
+  if (!parsed.success) return null;
+
+  const { slotRefs, ...rest } = parsed.data;
+  return { ...rest, slotRefs: new Map(slotRefs) };
 }
 
 /**
