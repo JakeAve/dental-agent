@@ -36,6 +36,7 @@ export type RedisLike = {
     opts?: { nx?: true; px?: number },
   ): Promise<unknown>;
   del(key: string): Promise<number>;
+  eval<T>(script: string, keys: string[], args: unknown[]): Promise<T>;
 };
 
 export type SharedStore = {
@@ -57,13 +58,45 @@ export type SharedStore = {
    * one module decides what a trustworthy run looks like.
    */
   loadRun(runId: string): Promise<unknown | null>;
-  /** Publish the run's state for whichever instance takes the next turn. */
-  saveRun(runId: string, run: PersistedRun): Promise<void>;
+  /**
+   * Publish the run's state for whichever instance takes the next turn, unless
+   * the stored copy is already at or past this version.
+   *
+   * True only when the write landed, which is what lets the caller advance its
+   * own version in step with the store rather than ahead of it.
+   */
+  saveRun(runId: string, run: PersistedRun): Promise<boolean>;
 };
 
 const turnKey = (runId: string, turnId: string) => `dental-agent:turn:${runId}:${turnId}`;
 const lockKey = (runId: string, turnId: string) => `dental-agent:lock:${runId}:${turnId}`;
 const runKey = (runId: string) => `dental-agent:run:${runId}`;
+
+/**
+ * Write the run only if it is newer than the stored copy. Returns 1 or 0.
+ *
+ * Server-side because the check and the write have to be one step. Reading the
+ * version in the route and writing it here leaves a gap wide enough for the
+ * failure this exists to stop: an instance whose read of the stored run failed
+ * open sees no version at all, and would otherwise publish its own thinner
+ * state — no patient id, no hold, no booking — over three turns of real work.
+ *
+ * An unreadable stored value is treated as absent and overwritten: it is of no
+ * use to anyone, and refusing to write would leave the run with no shared state
+ * for as long as it stood.
+ */
+const CAS_RUN = `
+local raw = redis.call('GET', KEYS[1])
+if raw then
+  local ok, current = pcall(cjson.decode, raw)
+  if ok and type(current) == 'table' and tonumber(current.seq) ~= nil
+     and tonumber(current.seq) >= tonumber(ARGV[2]) then
+    return 0
+  end
+end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', tonumber(ARGV[3]))
+return 1
+`;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -175,15 +208,45 @@ export function createSharedStore(
     },
 
     async saveRun(runId, run) {
+      const body = JSON.stringify(run);
+
       try {
-        // Last write wins. The evaluator drives one turn at a time per run, so
-        // concurrent writers are retries of the same turn converging on the
-        // same state rather than two different conversations racing.
-        await bounded('saveRun', () =>
-          redis.set(runKey(runId), run, { px: RUN_TTL_MS }),
+        const written = await bounded('saveRun', () =>
+          redis.eval<number>(CAS_RUN, [runKey(runId)], [
+            body,
+            run.seq,
+            RUN_TTL_MS,
+          ]),
         );
+
+        if (written !== 1) {
+          // Not an error: another instance is further along than we are. Its
+          // copy stands, and ours is the one that was behind.
+          console.warn(
+            `[idempotency] saveRun skipped: stored run is at or past seq ${run.seq}`,
+          );
+        }
+
+        return written === 1;
       } catch (err) {
         warn('saveRun', err);
+
+        // A store that cannot run the script at all — an outage, a timeout, or
+        // a deployment whose Redis does not support EVAL — should not mean the
+        // run stops being persisted entirely. Losing the compare costs us the
+        // guarantee that a stale instance cannot overwrite a fresher copy;
+        // losing the write costs every later cold instance its state, which is
+        // the worse of the two. Reported as not-written either way, so no
+        // version advances on the strength of a write that may not have landed.
+        try {
+          await bounded('saveRun/fallback', () =>
+            redis.set(runKey(runId), run, { px: RUN_TTL_MS }),
+          );
+        } catch (fallbackErr) {
+          warn('saveRun/fallback', fallbackErr);
+        }
+
+        return false;
       }
     },
   };

@@ -107,7 +107,11 @@ export function getRun(
           role: h.role === 'patient' ? ('user' as const) : ('assistant' as const),
           content: h.content,
         })),
-      seq: restored?.seq ?? storedSeq(restore),
+      // Zero when the stored copy could not be read, rather than its version:
+      // this run has no idea what that copy knew, so claiming its place in the
+      // order would let a history-only session outrank the real thing and be
+      // adopted by the instances still holding it.
+      seq: restored?.seq ?? 0,
       turns: new Map(),
       inFlight: new Map(),
       lastTouched: now,
@@ -120,12 +124,6 @@ export function getRun(
     run.session = restored.session;
     run.messages = restored.messages;
     run.seq = restored.seq;
-  } else if (!restored) {
-    // Something may be stored that this build cannot read — a schema change
-    // across a deployment looks exactly like this. The state is lost either
-    // way, but the version is still worth honouring so that what we publish
-    // next sorts after it instead of looking older than it is.
-    run.seq = Math.max(run.seq, storedSeq(restore));
   }
 
   run.lastTouched = now;
@@ -153,24 +151,22 @@ export type PersistedRun = {
 /**
  * The run, one version further along, ready to publish.
  *
- * The bump happens here rather than at the call site so that publishing and
- * versioning cannot drift apart: a copy written without advancing its version
- * would be adopted by nobody, and a version advanced without a write would make
- * this instance look fresher than the state it actually holds.
+ * Pure: the run's own version advances only in `publishedRun`, once the write
+ * is known to have landed. A version advanced on the strength of a write that
+ * failed open would make this instance look fresher than the state it holds,
+ * and it would then refuse to adopt the copy that really is newer.
  */
 export function serializeRun(run: Run): PersistedRun {
-  run.seq += 1;
   return {
     session: serializeSession(run.session),
     messages: run.messages,
-    seq: run.seq,
+    seq: run.seq + 1,
   };
 }
 
-/** A stored run's version, when nothing else about it can be trusted. */
-function storedSeq(raw: unknown): number {
-  const seq = (raw as { seq?: unknown } | null | undefined)?.seq;
-  return typeof seq === 'number' && Number.isFinite(seq) ? seq : 0;
+/** Records that a published version is now this run's own. */
+export function publishedRun(run: Run, published: PersistedRun) {
+  run.seq = Math.max(run.seq, published.seq);
 }
 
 /**

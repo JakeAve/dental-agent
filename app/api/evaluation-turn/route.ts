@@ -4,7 +4,13 @@ import { createClient } from '@/lib/cedar-ridge';
 import { agentBudgetMs, waitBudgetMs } from '@/lib/budget';
 import { PRACTICE, PROTOCOL_VERSION } from '@/lib/config';
 import { sharedStoreFromEnv } from '@/lib/idempotency';
-import { getRun, peekRun, serializeRun, type Turn } from '@/lib/run-store';
+import {
+  getRun,
+  peekRun,
+  publishedRun,
+  serializeRun,
+  type Turn,
+} from '@/lib/run-store';
 import { collapseRestartedReply } from '@/lib/reply';
 
 /**
@@ -260,7 +266,8 @@ export async function POST(req: Request) {
     // book a second appointment". The reverse order would leave the next turn
     // restoring a run that has forgotten this turn's patient id.
     if (shared) {
-      await shared.saveRun(run_id, serializeRun(run));
+      const published = serializeRun(run);
+      if (await shared.saveRun(run_id, published)) publishedRun(run, published);
       await shared.saveTurn(run_id, turn_id, turn);
     }
   } catch (err) {
@@ -287,7 +294,8 @@ export async function POST(req: Request) {
     // conversation" instead of booking a second appointment. Order matters, and
     // it costs one round trip on a path that has already given up on speed.
     if (shared) {
-      await shared.saveRun(run_id, serializeRun(run));
+      const published = serializeRun(run);
+      if (await shared.saveRun(run_id, published)) publishedRun(run, published);
       await shared.releaseTurn(run_id, turn_id);
     }
   } finally {

@@ -28,6 +28,28 @@ function fakeRedis(): RedisLike & { store: Map<string, unknown> } {
     async del(key) {
       return store.delete(key) ? 1 : 0;
     },
+    /**
+     * Stands in for the compare-and-set script, and only for it.
+     *
+     * A fake cannot prove the Lua parses or that this Redis runs it — that is
+     * what e2e/shared-store.spec.ts is for, against the real thing. What it can
+     * do is let the store's own behaviour around the script be tested here.
+     */
+    async eval(_script, keys, args) {
+      const [body, seq] = args as [string, number];
+      const current = store.get(keys[0]) as { seq?: unknown } | undefined;
+
+      if (
+        current &&
+        typeof current.seq === 'number' &&
+        current.seq >= Number(seq)
+      ) {
+        return 0 as never;
+      }
+
+      store.set(keys[0], JSON.parse(body));
+      return 1 as never;
+    },
   };
 }
 
@@ -35,16 +57,22 @@ function brokenRedis(): RedisLike {
   const boom = async () => {
     throw new Error('redis unreachable');
   };
-  return { get: boom, set: boom, del: boom };
+  return { get: boom, set: boom, del: boom, eval: boom };
 }
 
 /** Never answers. What a Redis that is up but unreachable actually looks like. */
 function hangingRedis(): RedisLike {
   const hang = () => new Promise<never>(() => {});
-  return { get: hang, set: hang, del: hang };
+  return { get: hang, set: hang, del: hang, eval: hang };
 }
 
 const TURN: Turn = { message: 'Are you a new or returning patient?', status: 'continue' };
+
+const RUN_AT_1 = {
+  session: { slotRefs: [] as never[], booked: [] as never[], resolved: false },
+  messages: [],
+  seq: 1,
+};
 
 describe('claimTurn', () => {
   it('grants the first claim and refuses the second', async () => {
@@ -105,8 +133,40 @@ describe('saveRun / loadRun', () => {
 
   it('round-trips a run for the instance that takes the next turn', async () => {
     const store = createSharedStore(fakeRedis());
-    await store.saveRun('r1', RUN);
+    expect(await store.saveRun('r1', RUN)).toBe(true);
     expect(await store.loadRun('r1')).toEqual(RUN);
+  });
+
+  /**
+   * The write has to refuse, not just the read. An instance whose `loadRun`
+   * failed open sees no version at all, so nothing on the read side stops it
+   * publishing its own thinner state — no patient id, no hold, no booking —
+   * over three turns of real work done elsewhere.
+   */
+  it('refuses a write from an instance that is behind', async () => {
+    const store = createSharedStore(fakeRedis());
+    const ahead = { ...RUN, seq: 5 };
+
+    expect(await store.saveRun('r1', ahead)).toBe(true);
+    expect(await store.saveRun('r1', { ...RUN, seq: 2 })).toBe(false);
+    expect(await store.loadRun('r1')).toEqual(ahead);
+  });
+
+  it('refuses a second write at the same version', async () => {
+    const store = createSharedStore(fakeRedis());
+    const first = { ...RUN, seq: 4, messages: [{ role: 'user' as const, content: 'first' }] };
+
+    expect(await store.saveRun('r1', first)).toBe(true);
+    expect(await store.saveRun('r1', { ...RUN, seq: 4 })).toBe(false);
+    expect(await store.loadRun('r1')).toEqual(first);
+  });
+
+  it('accepts each step forward', async () => {
+    const store = createSharedStore(fakeRedis());
+
+    expect(await store.saveRun('r1', { ...RUN, seq: 1 })).toBe(true);
+    expect(await store.saveRun('r1', { ...RUN, seq: 2 })).toBe(true);
+    expect(await store.saveRun('r1', { ...RUN, seq: 3 })).toBe(true);
   });
 
   it('misses for a run never saved', async () => {
@@ -145,9 +205,10 @@ describe('a shared store that hangs', () => {
     expect(await store.claimTurn('r1', 't1')).toBe(true);
     await store.saveTurn('r1', 't1', TURN);
     await store.releaseTurn('r1', 't1');
+    expect(await store.saveRun('r1', RUN_AT_1)).toBe(false);
 
-    // Five calls, each bounded, rather than five calls that never return.
-    expect(Date.now() - started).toBeLessThan(opTimeoutMs * 10);
+    // Six calls, each bounded, rather than five calls that never return.
+    expect(Date.now() - started).toBeLessThan(opTimeoutMs * 20);
   });
 
   it('stops waiting for another instance when the request budget runs out', async () => {
@@ -179,12 +240,8 @@ describe('redis outage', () => {
   it('degrades a run load to a cold start rather than failing the turn', async () => {
     const store = createSharedStore(brokenRedis());
     expect(await store.loadRun('r1')).toBeNull();
-    await expect(
-      store.saveRun('r1', {
-        session: { slotRefs: [], booked: [], resolved: false },
-        messages: [],
-        seq: 1,
-      }),
-    ).resolves.toBeUndefined();
+    // Reported as not-written, so no instance advances its version on the
+    // strength of a write that never landed.
+    expect(await store.saveRun('r1', RUN_AT_1)).toBe(false);
   });
 });
