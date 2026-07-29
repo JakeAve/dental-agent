@@ -119,15 +119,19 @@ export async function POST(req: Request) {
   if (shared) {
     const settled = await shared.getTurn(run_id, turn_id);
     if (settled) {
-      // Not cached locally on purpose: this instance may hold no run at all,
-      // and a run built here just to hold one turn would shadow the fuller
-      // state the next turn restores from the shared store.
+      // Cached here only if this process already holds the run. Building one
+      // just to hold a replayed turn would shadow the fuller state the next
+      // turn restores from the shared store; caching into a run we already have
+      // is what keeps a third retry answerable if Redis goes down in between,
+      // since every method there fails open and a failed-open claim is granted.
+      local?.turns.set(turn_id, settled);
       return reply(envelope(protocol_version, run_id, turn_id, settled));
     }
 
     if (!(await shared.claimTurn(run_id, turn_id))) {
       // Another instance is executing this turn right now.
       const won = await shared.awaitTurn(run_id, turn_id);
+      if (won) local?.turns.set(turn_id, won);
       return reply(
         envelope(
           protocol_version,
