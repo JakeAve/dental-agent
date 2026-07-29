@@ -4,6 +4,7 @@ import { createClient } from '@/lib/cedar-ridge';
 import { agentBudgetMs, waitBudgetMs } from '@/lib/budget';
 import { PRACTICE, PROTOCOL_VERSION } from '@/lib/config';
 import { sharedStoreFromEnv } from '@/lib/idempotency';
+import { errorLabel } from '@/lib/log';
 import {
   getRun,
   peekRun,
@@ -102,7 +103,7 @@ export async function POST(req: Request) {
     console.error(
       `[evaluation-turn] run=${echo.runId ?? '?'} turn=${echo.turnId ?? '?'} ` +
         'unhandled failure:',
-      err instanceof Error ? err.name : 'unknown error',
+      errorLabel(err),
     );
 
     // Before the ids are known there is no well-formed response to give, and a
@@ -335,12 +336,13 @@ async function handleTurn(
       await shared.saveTurn(run_id, turn_id, turn);
     }
   } catch (err) {
-    // Deliberately no error detail in the response: the key travels in this
-    // request, and a leaked message is a scored failure.
+    // No error detail in the response, and none in the log either: the key
+    // travels in this request, and neither a leaked message nor a leaked log
+    // line is worth the diagnosis. See lib/log.ts.
     console.error(
       `[evaluation-turn] run=${run_id} turn=${turn_id} ` +
         `${control.signal.aborted ? `exceeded ${agentBudget}ms` : 'failed'}:`,
-      err instanceof Error ? err.message : 'unknown error',
+      errorLabel(err),
     );
     turn = { message: FALLBACK, status: 'continue' };
 

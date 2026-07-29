@@ -6,6 +6,7 @@ import {
   TURN_WAIT_DEADLINE_MS,
   TURN_WAIT_POLL_MS,
 } from './config';
+import { errorLabel } from './log';
 import type { PersistedRun, Turn } from './run-store';
 
 /**
@@ -118,10 +119,9 @@ function withTimeout<T>(work: Promise<T>, ms: number, op: string): Promise<T> {
 }
 
 function warn(op: string, err: unknown) {
-  // Message only — never key material, and Redis errors can echo commands.
-  console.warn(
-    `[idempotency] ${op} failed open: ${err instanceof Error ? err.message : 'unknown error'}`,
-  );
+  // Class only. A Redis client is entitled to quote the command it was running,
+  // and the commands here carry a whole conversation. See lib/log.ts.
+  console.warn(`[idempotency] ${op} failed open: ${errorLabel(err)}`);
 }
 
 export function createSharedStore(
