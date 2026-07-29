@@ -88,6 +88,38 @@ export function statesAmount(message: string, appt: Appointment): boolean {
   return text.includes(exact) || text.includes(whole);
 }
 
+/* ------------------------------------------------------------------ *
+ * Claiming something happened
+ * ------------------------------------------------------------------ */
+
+/**
+ * Sentences that assert a booking exists, as opposed to offering to make one.
+ *
+ * Tense is the whole distinction: "I've booked you in" is a claim, "I'll book
+ * that for you" is not. Kept to completed forms for that reason.
+ */
+const BOOKED_CLAIM =
+  /\b(?:you(?:'re| are) (?:all set|booked|scheduled)|(?:is|are|has been|have been) (?:confirmed|booked|scheduled)|i(?:'ve| have) (?:booked|scheduled|confirmed))\b/i;
+
+/** Anything that flips the claim into a denial — "that has NOT been booked". */
+const NEGATOR = /\b(?:not|n't|no|never|unable|cannot|fail(?:ed)?|couldn)\b/i;
+
+/**
+ * Did the agent tell the patient a booking exists?
+ *
+ * Checked sentence by sentence, because a reply that says "nothing has been
+ * booked yet — shall I look again?" contains a claim pattern and a denial, and
+ * only their pairing within one sentence tells you which was meant.
+ *
+ * Used for the assertion that matters most on a failed booking: when the API
+ * created nothing, no reply may say otherwise.
+ */
+export function claimsBooked(message: string): boolean {
+  return message
+    .split(/(?<=[.!?\n])/)
+    .some((sentence) => BOOKED_CLAIM.test(sentence) && !NEGATOR.test(sentence));
+}
+
 /** The one message where the agent reported the booking, if there is one. */
 export function confirmationMessage(
   transcript: Exchange[],

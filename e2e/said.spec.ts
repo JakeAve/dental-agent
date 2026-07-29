@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Appointment } from '../lib/cedar-ridge';
 import {
+  claimsBooked,
   confirmationMessage,
   statesAmount,
   statesProvider,
@@ -94,6 +95,40 @@ describe('statesAmount', () => {
     expect(
       statesAmount('You are booked for Wednesday, July 29 at 4:00 PM.', WEDNESDAY),
     ).toBe(false);
+  });
+});
+
+describe('claimsBooked', () => {
+  it('catches a completed booking claim', () => {
+    expect(claimsBooked(REPORTED_WEDNESDAY)).toBe(true);
+    expect(claimsBooked("You're all set for Thursday at 8 AM.")).toBe(true);
+    expect(claimsBooked("I've booked you in with Dr. Reyes.")).toBe(true);
+  });
+
+  it('does not mistake an offer to book for a booking', () => {
+    // The distinction the recovery specs depend on: after a failed confirm the
+    // agent may say what it *will* do, but not that it already did.
+    expect(claimsBooked('I can book that for you — shall I go ahead?')).toBe(false);
+    expect(claimsBooked('Once you confirm, I will book it right away.')).toBe(false);
+    expect(claimsBooked('Would you like me to book Thursday at 8?')).toBe(false);
+  });
+
+  it('does not mistake a denial for a claim', () => {
+    expect(claimsBooked('Nothing has been booked yet.')).toBe(false);
+    expect(claimsBooked("I wasn't able to book that time, sorry.")).toBe(false);
+    expect(claimsBooked('That time is no longer available, so it is not booked.')).toBe(
+      false,
+    );
+  });
+
+  it('catches a claim that shares a reply with an unrelated denial', () => {
+    // One sentence denies, the next claims. Judged per sentence, so the claim
+    // still counts — a whole-message negation check would miss this.
+    expect(
+      claimsBooked(
+        'I could not reach your insurer. Your cleaning is confirmed for Thursday at 8:00 AM.',
+      ),
+    ).toBe(true);
   });
 });
 

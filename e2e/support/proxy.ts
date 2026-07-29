@@ -25,6 +25,36 @@ export type RecordedCall = {
   durationMs: number;
   /** Epoch ms when the request *arrived*. Used to prove work stopped. */
   at: number;
+  /** True when this answer was injected here, not returned by the API. */
+  injected?: boolean;
+};
+
+/**
+ * A failure answered locally instead of forwarded.
+ *
+ * The recovery paths worth testing most — a lapsed hold, a superseded one — are
+ * the ones a live sandbox will not produce on demand: the first needs a
+ * five-minute stall, the second needs a race. Injecting them keeps those tests
+ * to a few seconds, and because the request never leaves the proxy it cannot
+ * change real state in a shared sandbox.
+ */
+export type Fault = {
+  method: string;
+  /** Normalized route, e.g. `/api/v1/appointments`. */
+  route: string;
+  status: number;
+  body: unknown;
+  /**
+   * Narrows the fault to particular requests.
+   *
+   * Needed to simulate a failure *faithfully*. A hold that expires is dead for
+   * good, so a fault that fires once and then lets the same hold through lets a
+   * retry of the dead hold succeed — which no real expiry ever would, and which
+   * hides the very mistake the test is looking for. Keyed on the request body
+   * plus ids the proxy has seen go past, the fault can stay attached to one
+   * hold and let a genuinely fresh one through.
+   */
+  when?: (requestBody: string, seen: { holdIds: string[] }) => boolean;
 };
 
 export type Proxy = {
@@ -34,6 +64,13 @@ export type Proxy = {
   patientIds: string[];
   /** Bookings the breaker refused. Non-empty means a test misbehaved. */
   refusedBookings: number;
+  /**
+   * How many injected faults actually fired.
+   *
+   * Asserted on, always: a fault that never matched turns its test into one
+   * that passes without exercising anything.
+   */
+  faultsFired: number;
   close: () => Promise<void>;
 };
 
@@ -64,13 +101,20 @@ export async function startProxy(options: {
    * touching product code, so the abort path can be exercised for real.
    */
   delayMs?: number;
+  /** Failures to answer locally rather than forward. See `Fault`. */
+  faults?: Fault[];
 }): Promise<Proxy> {
   const target = options.target.replace(/\/+$/, '');
 
   const calls: RecordedCall[] = [];
   const appointmentIds: string[] = [];
   const patientIds: string[] = [];
+  /** Hold ids seen going past, oldest first — what `Fault.when` matches on. */
+  const holdIds: string[] = [];
   let refusedBookings = 0;
+
+  const faults = options.faults ?? [];
+  let faultsFired = 0;
 
   const server: Server = createServer((req, res) => {
     // A cancelled turn aborts its in-flight request, which lands here as an
@@ -115,6 +159,32 @@ export async function startProxy(options: {
         return;
       }
 
+      // Injected failure, if one is armed for this call. Checked after the
+      // breaker so the safety cap always wins, and before forwarding so the
+      // request never reaches the API.
+      const fault = faults.find(
+        (candidate) =>
+          candidate.method === method &&
+          candidate.route === normalize(path) &&
+          (!candidate.when || candidate.when(body.toString('utf8'), { holdIds })),
+      );
+
+      if (fault) {
+        faultsFired += 1;
+        calls.push({
+          method,
+          route: normalize(path),
+          path,
+          status: fault.status,
+          durationMs: 0,
+          at: started,
+          injected: true,
+        });
+        res.writeHead(fault.status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(fault.body));
+        return;
+      }
+
       // Forward verbatim. Hop-by-hop headers and the original host would
       // confuse the upstream, so they are dropped.
       const headers = new Headers();
@@ -152,6 +222,11 @@ export async function startProxy(options: {
             if (isBooking && json.id) {
               appointmentIds.push(json.id);
               record({ kind: 'appointment', id: json.id, scenario: options.scenario });
+            } else if (method === 'POST' && route === '/api/v1/holds') {
+              // Not an id to clean up — holds release themselves. Captured so a
+              // fault can stay pinned to one hold across retries.
+              const { hold_id: heldId } = json as { hold_id?: string };
+              if (heldId) holdIds.push(heldId);
             } else if (method === 'POST' && route === '/api/v1/patients' && json.id) {
               patientIds.push(json.id);
               record({ kind: 'patient', id: json.id, scenario: options.scenario });
@@ -209,6 +284,9 @@ export async function startProxy(options: {
     patientIds,
     get refusedBookings() {
       return refusedBookings;
+    },
+    get faultsFired() {
+      return faultsFired;
     },
     close: () =>
       new Promise<void>((resolve, reject) =>

@@ -5,7 +5,7 @@ import { createClient } from '../../lib/cedar-ridge';
 import { markReleased } from './ledger';
 import { openingMessage, replyTo, type Exchange } from './patient';
 import type { Persona } from './personas';
-import { startProxy, type RecordedCall } from './proxy';
+import { startProxy, type Fault, type RecordedCall } from './proxy';
 import { sendTurn } from './protocol';
 
 export const AGENT_URL =
@@ -34,10 +34,17 @@ export type RunResult = {
   appointmentIds: string[];
   /** Bookings the proxy's circuit breaker refused. Should always be 0. */
   refusedBookings: number;
+  /** Injected faults that actually fired. Zero means the test proved nothing. */
+  faultsFired: number;
   /** Convenience: did the agent hit this route at all? */
   called: (route: string, method?: string) => boolean;
   /** True if any upstream call came back 429 — the key's budget is spent. */
   rateLimited: boolean;
+};
+
+export type ScenarioOptions = {
+  /** Failures to inject rather than forward. See `support/faults.ts`. */
+  faults?: Fault[];
 };
 
 /**
@@ -46,7 +53,10 @@ export type RunResult = {
  * The agent is reached only over HTTP, and its view of the dental API is the
  * proxy — so nothing here depends on how the agent is implemented.
  */
-export async function runScenario(persona: Persona): Promise<RunResult> {
+export async function runScenario(
+  persona: Persona,
+  options: ScenarioOptions = {},
+): Promise<RunResult> {
   const { baseUrl, apiKey } = apiConfig();
   const runId = `e2e-${persona.id}-${randomUUID()}`;
 
@@ -54,6 +64,7 @@ export async function runScenario(persona: Persona): Promise<RunResult> {
     target: baseUrl,
     scenario: persona.id,
     maxBookings: persona.maxBookings,
+    faults: options.faults,
   });
 
   const transcript: Exchange[] = [];
@@ -105,6 +116,7 @@ export async function runScenario(persona: Persona): Promise<RunResult> {
     calls: proxy.calls,
     appointmentIds: [...proxy.appointmentIds],
     refusedBookings: proxy.refusedBookings,
+    faultsFired: proxy.faultsFired,
     called: (route, method = 'POST') => routes.has(`${method} ${route}`),
     rateLimited: proxy.calls.some((c) => c.status === 429),
   };

@@ -99,6 +99,29 @@ export const PERSONAS: Record<string, Persona> = {
     maxBookings: 0,
   },
 
+  S37: {
+    id: 'S37',
+    title: 'Availability pagination — asks for more than the first page',
+    goal:
+      'Ask to be shown times for a cleaning sometime in the next month. When ' +
+      'you are offered specific times, say none of those work for you and ask ' +
+      'what else there is. Ask a second time if you are offered another short ' +
+      'list. Do NOT agree to book anything — you are only seeing what exists.',
+    facts: {
+      ...RETURNING,
+      'insurance situation': 'I will pay out of pocket, no insurance',
+      // Deliberately unconstrained: a day or time-of-day preference would let
+      // the agent narrow the search, which is correct behaviour but a different
+      // path from the paging this scenario is here to exercise.
+      availability: 'you are completely flexible — any day, any time works',
+    },
+    style:
+      'Non-committal. You want to hear the full range of options before ' +
+      'choosing anything, and you keep asking what else there is.',
+    maxTurns: 8,
+    maxBookings: 0,
+  },
+
   S30: {
     id: 'S30',
     title: 'Symptoms route to an exam, not a treatment',
