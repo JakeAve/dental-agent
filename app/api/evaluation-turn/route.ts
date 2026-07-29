@@ -143,13 +143,18 @@ export async function POST(req: Request) {
     }
   }
 
-  // This instance owns the turn. Materialise the run — restoring what earlier
-  // turns established if we have never seen this one, because visible history
-  // alone would lose the patient id, the offered slots and any live hold, and
-  // an agent that cannot see its own patient record registers a second one.
-  const run =
-    local ??
-    getRun(run_id, input.history, shared ? await shared.loadRun(run_id) : undefined);
+  // This instance owns the turn. Materialise the run against the shared store —
+  // asked for even when this process already holds the run, because holding a
+  // run is not the same as holding the latest one. Instances stay warm, so turn
+  // 4 can land back on the instance that served turn 1 and has never heard
+  // about the hold taken on turn 3. Visible history cannot cover the gap: it
+  // carries neither the patient id nor the slots, and an agent that cannot see
+  // its own patient record registers a second one.
+  const run = getRun(
+    run_id,
+    input.history,
+    shared ? await shared.loadRun(run_id) : undefined,
+  );
 
   /**
    * The turn's kill switch.

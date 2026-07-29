@@ -94,6 +94,7 @@ describe('saveRun / loadRun', () => {
   const RUN = {
     session: { slotRefs: [] as never[], booked: [] as never[], resolved: false },
     messages: [{ role: 'user' as const, content: 'I need a cleaning.' }],
+    seq: 1,
   };
 
   it('round-trips a run for the instance that takes the next turn', async () => {
@@ -134,7 +135,11 @@ describe('redis outage', () => {
     const store = createSharedStore(brokenRedis());
     expect(await store.loadRun('r1')).toBeNull();
     await expect(
-      store.saveRun('r1', { session: { slotRefs: [], booked: [], resolved: false }, messages: [] }),
+      store.saveRun('r1', {
+        session: { slotRefs: [], booked: [], resolved: false },
+        messages: [],
+        seq: 1,
+      }),
     ).resolves.toBeUndefined();
   });
 });
