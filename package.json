@@ -6,12 +6,23 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "smoke": "tsx --env-file=.env scripts/smoke.ts",
+    "e2e": "vitest run",
+    "e2e:smoke": "vitest run e2e/protocol.spec.ts",
+    "e2e:core": "vitest run e2e/protocol.spec.ts e2e/outcomes.spec.ts",
+    "e2e:full": "vitest run",
+    "e2e:watch": "vitest",
+    "e2e:cleanup": "tsx --env-file=.env scripts/e2e-cleanup.ts"
   },
   "dependencies": {
+    "@ai-sdk/openai": "^4.0.24",
+    "@ai-sdk/react": "^4.0.45",
+    "ai": "^7.0.42",
     "next": "16.2.12",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
@@ -21,6 +32,8 @@
     "eslint": "^9",
     "eslint-config-next": "16.2.12",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "tsx": "^4.23.1",
+    "typescript": "^5",
+    "vitest": "^4.1.10"
   }
 }

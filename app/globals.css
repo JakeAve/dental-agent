@@ -1,26 +1,55 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+/**
+ * Two worlds, deliberately.
+ *
+ * The left half is the product a patient would see — warm paper, a calm clinical
+ * teal, roomy type. The right half is instrumentation — dark, dense, mono. The
+ * seam between them is the point: it should always be obvious which side of the
+ * glass you are looking at, so a tool argument is never mistaken for something
+ * the patient was actually told.
+ *
+ * The chat pane is deliberately not theme-aware. It is the fixture under test —
+ * it should look identical every time you open it, whatever the OS is set to.
+ */
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+@theme {
+  /* Patient side — warm paper */
+  --color-paper: #faf6f1;
+  --color-card: #ffffff;
+  --color-ink: #221f1b;
+  --color-ink-soft: #6b6259;
+  --color-ink-faint: #a1968a;
+  --color-rule: #e8e0d6;
+  --color-clinical: #0d6b62;
+  --color-clinical-soft: #e3f0ee;
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  /* Instrument side — dark rail */
+  --color-rail: #0f1216;
+  --color-rail-panel: #161a20;
+  --color-rail-raised: #1d222a;
+  --color-rail-rule: #272d37;
+  --color-rail-text: #c3ccd8;
+  --color-rail-dim: #6f7b8b;
+  --color-signal: #5ad2c0;
+  --color-signal-ok: #7ac97f;
+  --color-signal-warn: #e0ad4e;
+  --color-signal-bad: #ef6f6c;
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
+  --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
+    ui-serif, serif;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-rail);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+}
+
+/* The trace rail scrolls a lot; a chunky scrollbar fights the density. */
+.rail-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-rail-rule) transparent;
 }
