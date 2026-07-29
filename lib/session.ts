@@ -100,17 +100,23 @@ export const createSession = (): Session => ({
 /**
  * True when this patient may not search availability yet.
  *
- * `not_accepted` and `invalid_member` still block: the API wants a resolution,
- * and the honest resolution is electing self-pay. An unknown patient falls
- * through to the API rather than being blocked on a guess.
+ * `active`, `self_pay` and `not_accepted` all open availability at the API. The
+ * third is the surprising one and it is deliberate: an out-of-network plan is a
+ * settled answer, not a failure — the practice does not take it, so the visit
+ * is charged at the self-pay price and the patient is free to book. Requiring
+ * them to convert to `self_pay` first added a step the API does not want and
+ * left the run recorded as self-pay when it was really an unaccepted plan.
+ *
+ * `invalid_member` does block. Nothing has been settled there: the id did not
+ * verify, and the resolution is a working id or an explicit election.
+ *
+ * An unknown patient falls through to the API rather than being blocked on a
+ * guess.
  */
 export function insuranceBlocks(session: Session): boolean {
   const status = session.insurance?.status;
   return (
-    status === undefined ||
-    status === 'unverified' ||
-    status === 'invalid_member' ||
-    status === 'not_accepted'
+    status === undefined || status === 'unverified' || status === 'invalid_member'
   );
 }
 
@@ -308,6 +314,16 @@ export function describeSession(session: Session, now = new Date()): string {
       );
     } else if (ins.status === 'self_pay') {
       lines.push('Insurance: self-pay elected. Quote self-pay prices.');
+    } else if (ins.status === 'not_accepted') {
+      lines.push(
+        `Insurance: ${ins.planName ?? 'that plan'} is not accepted here — the ` +
+          'practice is out of network for it. This IS settled: you can search ' +
+          'times and book. Their plan is perfectly valid, it just cannot be ' +
+          'billed here, so the visit is charged at the self-pay price. Say both ' +
+          'things in the same breath — that it is not accepted, and what the ' +
+          'visit will cost — before you book. Do not ask them to switch to ' +
+          'self-pay; nothing needs switching.',
+      );
     } else {
       lines.push(
         `Insurance: ${ins.status} — NOT settled. The patient must either supply ` +

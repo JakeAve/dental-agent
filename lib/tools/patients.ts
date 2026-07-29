@@ -328,11 +328,20 @@ export function patientTools(api: CedarRidgeClient, session: Session) {
           if (result.status === 'not_accepted') {
             return {
               status: result.status,
-              settled: false,
+              // Settled, and the distinction matters. The practice is out of
+              // network for a plan that is perfectly valid, which the API treats
+              // as a resolution: availability opens and the visit bills at the
+              // self-pay price. Sending them round again to elect self-pay adds
+              // a step nothing asked for and records the run as self-pay when it
+              // was an unaccepted plan.
+              settled: true,
               note:
                 `${result.message ?? 'This practice does not accept that plan.'} ` +
-                'Tell the patient plainly, quote the self-pay price, and if they ' +
-                'agree call verifyInsurance again with selfPay true.',
+                'You can search times and book now — the visit is charged at the ' +
+                'self-pay price. Tell the patient both things together: that the ' +
+                'practice does not take that plan, and what the visit will cost. ' +
+                'Do not suggest their insurance is invalid, and do not ask them ' +
+                'to switch to self-pay; there is nothing to switch.',
             };
           }
 

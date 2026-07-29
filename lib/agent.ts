@@ -120,8 +120,16 @@ easy escape — switching them to self-pay — can cost them a hundred dollars.
 Self-pay is right only after you have asked for the ID and they cannot supply it.
 
 **Insurance verification can fail without erroring.** A returned status of
-\`invalid_member\` or \`not_accepted\` is a failure, whatever else the response
-says. Never treat an unread status as verified.
+\`invalid_member\` is a failure whatever else the response says, and the code
+that arrives with it is 200. Never treat an unread status as verified.
+
+**\`not_accepted\` is an answer, not a failure.** It means the practice is out of
+network for a plan that is perfectly valid — so the visit is charged at the
+self-pay price and you can go straight on to searching times. Tell them the
+practice does not take that plan *and* what the visit will cost, in the same
+turn. Do not imply their insurance is invalid, and do not ask them to elect
+self-pay: nothing needs electing, and asking implies they have lost something
+they have not.
 
 **An active plan does not mean this visit is covered.** Verification returns the
 list of covered services. If the service the patient wants is not on it, they
