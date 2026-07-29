@@ -46,6 +46,27 @@ export const TURN_DEADLINE_MS = 16_000;
 // Next analyses segment config statically and rejects imported values.
 
 /* ------------------------------------------------------------------ *
+ * Cross-instance idempotency (lib/idempotency.ts)
+ * ------------------------------------------------------------------ */
+
+/**
+ * How long a claimed turn stays claimed. Longer than the evaluator's timeout
+ * so a completed turn cannot be re-claimed and re-executed the moment it
+ * finishes; short enough that a crashed instance frees the turn for a retry.
+ */
+export const LOCK_TTL_MS = EVALUATOR_TIMEOUT_MS + 5_000;
+
+/** How often a losing instance polls for the winner's saved turn. */
+export const TURN_WAIT_POLL_MS = 400;
+
+/**
+ * How long a losing instance waits before answering with the fallback.
+ * Bounded by the internal turn deadline for the same reason it is: better a
+ * real sentence inside the evaluator's limit than a timeout.
+ */
+export const TURN_WAIT_DEADLINE_MS = TURN_DEADLINE_MS;
+
+/* ------------------------------------------------------------------ *
  * Run store
  * ------------------------------------------------------------------ */
 

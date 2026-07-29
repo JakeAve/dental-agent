@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { runAgentOnce } from '@/lib/agent';
 import { createClient } from '@/lib/cedar-ridge';
 import { PRACTICE, PROTOCOL_VERSION, TURN_DEADLINE_MS } from '@/lib/config';
+import { turnStoreFromEnv } from '@/lib/idempotency';
 import { getRun, type Turn } from '@/lib/run-store';
 import { collapseRestartedReply } from '@/lib/reply';
 
@@ -108,6 +109,33 @@ export async function POST(req: Request) {
     return reply(envelope(protocol_version, run_id, turn_id, await racing));
   }
 
+  // Third layer, across instances: the maps above are per-process, and Vercel
+  // routes retries wherever it likes — a replay landing on a fresh instance
+  // would sail past both and act twice. With Redis configured, exactly one
+  // instance claims each turn; the rest replay its saved result or wait for it.
+  const shared = turnStoreFromEnv();
+  if (shared) {
+    const settled = await shared.getTurn(run_id, turn_id);
+    if (settled) {
+      run.turns.set(turn_id, settled);
+      return reply(envelope(protocol_version, run_id, turn_id, settled));
+    }
+
+    if (!(await shared.claimTurn(run_id, turn_id))) {
+      // Another instance is executing this turn right now.
+      const won = await shared.awaitTurn(run_id, turn_id);
+      if (won) run.turns.set(turn_id, won);
+      return reply(
+        envelope(
+          protocol_version,
+          run_id,
+          turn_id,
+          won ?? { message: FALLBACK, status: 'continue' },
+        ),
+      );
+    }
+  }
+
   /**
    * The turn's kill switch.
    *
@@ -178,6 +206,10 @@ export async function POST(req: Request) {
   try {
     turn = await work;
     run.turns.set(turn_id, turn);
+    // Publish before responding, so a retry that races the response cannot
+    // land on another instance ahead of the saved turn. The claim lock stays:
+    // releasing it here would let a late retry claim and re-run a finished turn.
+    if (shared) await shared.saveTurn(run_id, turn_id, turn);
   } catch (err) {
     // Deliberately no error detail in the response: the key travels in this
     // request, and a leaked message is a scored failure.
@@ -187,7 +219,9 @@ export async function POST(req: Request) {
       err instanceof Error ? err.message : 'unknown error',
     );
     turn = { message: FALLBACK, status: 'continue' };
-    // Not cached — a retry of a timed-out turn deserves a real attempt.
+    // Not cached, and the claim is freed — a retry of a timed-out turn
+    // deserves a real attempt, on whichever instance it lands.
+    if (shared) await shared.releaseTurn(run_id, turn_id);
   } finally {
     // Both matter: an un-cleared timer would abort a client that finished in
     // time (harmless here, but it keeps the process alive), and a live entry
