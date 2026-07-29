@@ -94,9 +94,9 @@ export const TURN_WAIT_DEADLINE_MS = TURN_DEADLINE_MS;
  * Hard ceiling on a single shared-store call.
  *
  * Upstash retries network failures five times by default, backing off
- * exponentially — over ten seconds of sleeping inside a twenty-second budget,
- * spent before the model has been asked anything. Every method here already
- * fails open, so cutting a slow call short costs the same as an outage: the
+ * exponentially: about four seconds of sleeping across six attempts, inside a
+ * twenty-second budget, spent before the model has been asked anything. Every
+ * method here already fails open, so cutting a slow call short costs the same as an outage: the
  * per-instance behaviour we had before Redis existed. Waiting does not.
  */
 export const REDIS_OP_TIMEOUT_MS = 700;

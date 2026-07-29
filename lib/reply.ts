@@ -31,6 +31,11 @@ export const MAX_MESSAGE_BYTES = 32 * 1024;
 
 const utf8 = new TextEncoder();
 
+const ELLIPSIS = '…';
+
+/** Said when a reply trims away to nothing, so that something is still said. */
+const NOTHING_TO_SAY = "Sorry — could you say that again?";
+
 /**
  * Trim a reply to the byte ceiling, on a boundary the patient can read.
  *
@@ -39,22 +44,33 @@ const utf8 = new TextEncoder();
  * non-empty, because an empty `output.message` is itself a protocol violation.
  */
 export function capMessage(text: string): string {
+  // Checked before the size, because whitespace is under any ceiling and still
+  // not a message. An empty `output.message` is a protocol violation in its own
+  // right, so it is the one thing this cannot pass through.
+  if (!text.trim()) return NOTHING_TO_SAY;
+
   if (utf8.encode(text).length <= MAX_MESSAGE_BYTES) return text;
+
+  // Room for the ellipsis, which is three bytes and not one.
+  const ceiling = MAX_MESSAGE_BYTES - utf8.encode(ELLIPSIS).length;
 
   // Slice by code point, then tighten until the encoded form fits: characters
   // vary between one and four bytes, so one pass cannot know where to stop.
-  const points = [...text];
-  let kept = points.slice(0, MAX_MESSAGE_BYTES);
-  while (utf8.encode(kept.join('')).length > MAX_MESSAGE_BYTES - 1) {
+  let kept = [...text].slice(0, ceiling);
+  while (utf8.encode(kept.join('')).length > ceiling) {
     kept = kept.slice(0, Math.floor(kept.length * 0.9));
   }
 
   const trimmed = kept.join('');
+  // Compared in the same units as the index it is checking — characters, not
+  // bytes. Against a byte count, a reply of multi-byte characters could never
+  // reach the threshold and so would never break on a word at all.
   const lastBreak = trimmed.lastIndexOf(' ');
-  const clean = (lastBreak > MAX_MESSAGE_BYTES / 2 ? trimmed.slice(0, lastBreak) : trimmed)
-    .trimEnd();
+  const clean = (
+    lastBreak > trimmed.length / 2 ? trimmed.slice(0, lastBreak) : trimmed
+  ).trimEnd();
 
-  return `${clean}…`;
+  return clean ? `${clean}${ELLIPSIS}` : NOTHING_TO_SAY;
 }
 
 export function collapseRestartedReply(text: string): string {

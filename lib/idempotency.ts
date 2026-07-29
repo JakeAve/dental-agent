@@ -7,7 +7,7 @@ import {
   TURN_WAIT_POLL_MS,
 } from './config';
 import { errorLabel } from './log';
-import type { PersistedRun, Turn } from './run-store';
+import { parseTurn, type PersistedRun, type Turn } from './run-store';
 
 /**
  * The cross-instance half of the protocol's state requirements, backed by
@@ -137,12 +137,14 @@ export function createSharedStore(
   const opTimeoutMs = opts.opTimeoutMs ?? REDIS_OP_TIMEOUT_MS;
 
   /** Bounded, and failing open on the timeout exactly as on an outage. */
-  const bounded = <T>(op: string, work: () => Promise<T>) =>
-    withTimeout(work(), opTimeoutMs, op);
+  const bounded = <T>(op: string, work: () => Promise<T>, ms = opTimeoutMs) =>
+    withTimeout(work(), ms, op);
 
   const getTurn = async (runId: string, turnId: string) => {
     try {
-      return await bounded('getTurn', () => redis.get<Turn>(turnKey(runId, turnId)));
+      // Validated, not cast: this value is replayed to the evaluator without
+      // passing through any of the code that produced the original.
+      return parseTurn(await bounded('getTurn', () => redis.get(turnKey(runId, turnId))));
     } catch (err) {
       warn('getTurn', err);
       return null;
@@ -157,8 +159,14 @@ export function createSharedStore(
         // The lock outlives the evaluator's timeout so a finished turn cannot
         // be claimed again the moment it completes; it expires on its own if
         // the winner dies without saving or releasing.
-        const won = await bounded('claimTurn', () =>
-          redis.set(lockKey(runId, turnId), '1', { nx: true, px: LOCK_TTL_MS }),
+        // Given longer than the rest, because this is the one call whose
+        // fail-open direction is dangerous: cut short, it grants a claim that
+        // may already belong to someone else, and on a booking turn that is a
+        // second booking. A read failing open merely costs state.
+        const won = await bounded(
+          'claimTurn',
+          () => redis.set(lockKey(runId, turnId), '1', { nx: true, px: LOCK_TTL_MS }),
+          opTimeoutMs * 2,
         );
         return won !== null;
       } catch (err) {
@@ -185,6 +193,9 @@ export function createSharedStore(
       while (Date.now() < deadline) {
         const turn = await getTurn(runId, turnId);
         if (turn) return turn;
+        // Checked before sleeping as well as before polling: a poll that starts
+        // just inside the deadline would otherwise overshoot it by the interval.
+        if (Date.now() + pollIntervalMs >= deadline) break;
         await sleep(pollIntervalMs);
       }
       return null;
@@ -229,23 +240,15 @@ export function createSharedStore(
 
         return written === 1;
       } catch (err) {
+        // No plain-SET fallback here, on purpose. The reason this call fails is
+        // almost always the per-op timeout, and that is the same condition that
+        // makes an instance stale: its own `loadRun` failed open moments ago, so
+        // it has no idea what the stored copy holds. An unconditional write then
+        // lands exactly the state the script exists to refuse. Declining costs
+        // nothing when the stored copy is fresher, which is the case that
+        // matters; EVAL support itself is not in question, and is checked
+        // against the real Redis in e2e/shared-store.spec.ts.
         warn('saveRun', err);
-
-        // A store that cannot run the script at all — an outage, a timeout, or
-        // a deployment whose Redis does not support EVAL — should not mean the
-        // run stops being persisted entirely. Losing the compare costs us the
-        // guarantee that a stale instance cannot overwrite a fresher copy;
-        // losing the write costs every later cold instance its state, which is
-        // the worse of the two. Reported as not-written either way, so no
-        // version advances on the strength of a write that may not have landed.
-        try {
-          await bounded('saveRun/fallback', () =>
-            redis.set(runKey(runId), run, { px: RUN_TTL_MS }),
-          );
-        } catch (fallbackErr) {
-          warn('saveRun/fallback', fallbackErr);
-        }
-
         return false;
       }
     },
@@ -272,8 +275,8 @@ export function sharedStoreFromEnv(): SharedStore | null {
             url,
             token,
             // One quick retry, not the default five with exponential backoff,
-            // which is upwards of ten seconds of sleeping inside a
-            // twenty-second turn. The per-call timeout already stops us
+            // which is around four seconds of sleeping inside a twenty-second
+            // turn. The per-call timeout already stops us
             // *waiting* on that; what it cannot stop is the abandoned call
             // carrying on retrying, on an instance that is trying to finish a
             // response. A turn that proceeds without the shared store works.

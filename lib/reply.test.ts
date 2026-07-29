@@ -99,3 +99,23 @@ describe('capMessage', () => {
     expect(capMessage('x'.repeat(MAX_MESSAGE_BYTES + 1)).trim()).not.toBe('');
   });
 });
+
+describe('capMessage, at the boundary', () => {
+  const bytesOf = (s: string) => new TextEncoder().encode(s).length;
+
+  it('stays under the ceiling for a reply that lands just over it', () => {
+    // Two-byte characters with no spaces in the tail: the shape that used to
+    // come out two bytes over, because the ellipsis costs three and only one
+    // was reserved for it.
+    for (const accented of [3275, 3276, 3277, 4000, 16000]) {
+      const runaway = 'é'.repeat(accented) + 'x'.repeat(MAX_MESSAGE_BYTES);
+      expect(bytesOf(capMessage(runaway))).toBeLessThanOrEqual(MAX_MESSAGE_BYTES);
+    }
+  });
+
+  it('never returns an empty message, whatever it was given', () => {
+    for (const input of ['', '   ', '\n\n', ' '.repeat(MAX_MESSAGE_BYTES * 2)]) {
+      expect(capMessage(input).trim()).not.toBe('');
+    }
+  });
+});

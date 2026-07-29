@@ -35,6 +35,25 @@ export type Turn = {
   status: 'continue' | 'complete';
 };
 
+const turnSchema = z.object({
+  message: z.string().min(1),
+  status: z.enum(['continue', 'complete']),
+});
+
+/**
+ * A turn read back from the shared store, or null if it is not one.
+ *
+ * A replayed turn is answered verbatim, so it reaches the evaluator without
+ * passing any of the code that produced the original. The protocol treats an
+ * empty message and an unsupported status the same way it treats a timeout —
+ * the run ends as an endpoint error — so a stored value that is not a turn must
+ * read as a miss and be executed afresh, not forwarded.
+ */
+export function parseTurn(raw: unknown): Turn | null {
+  const parsed = turnSchema.safeParse(raw);
+  return parsed.success ? parsed.data : null;
+}
+
 type Run = {
   session: Session;
   messages: ModelMessage[];
@@ -58,16 +77,25 @@ type Run = {
 
 const runs = new Map<string, Run>();
 
+/**
+ * A run with work in flight is never evicted, whatever its age or the cap.
+ *
+ * Dropping one loses the promise a racing retry would have waited on, and the
+ * retry then builds a fresh run and executes a turn that is already running —
+ * two bookings from one turn_id, caused by a memory backstop.
+ */
+const busy = (run: Run) => run.inFlight.size > 0;
+
 function evict(now: number) {
   for (const [id, run] of runs) {
-    if (now - run.lastTouched > RUN_TTL_MS) runs.delete(id);
+    if (now - run.lastTouched > RUN_TTL_MS && !busy(run)) runs.delete(id);
   }
 
   // Hard cap as a backstop, oldest first.
   if (runs.size > MAX_RUNS) {
-    const ordered = [...runs.entries()].sort(
-      (a, b) => a[1].lastTouched - b[1].lastTouched,
-    );
+    const ordered = [...runs.entries()]
+      .filter(([, run]) => !busy(run))
+      .sort((a, b) => a[1].lastTouched - b[1].lastTouched);
     for (const [id] of ordered.slice(0, runs.size - MAX_RUNS)) runs.delete(id);
   }
 }
@@ -117,7 +145,7 @@ export function getRun(
       lastTouched: now,
     };
     runs.set(runId, run);
-  } else if (restored && restored.seq > run.seq) {
+  } else if (restored && restored.seq > run.seq && notBehind(restored, run)) {
     // Another instance has taken this run further. Adopt its state in place —
     // the Run object itself must survive, because the in-flight and completed
     // turn maps hanging off it are this process's own idempotency record.
@@ -128,6 +156,29 @@ export function getRun(
 
   run.lastTouched = now;
   return run;
+}
+
+/**
+ * Whether a stored copy can be adopted without losing anything.
+ *
+ * The version orders writes; it is not proof of content, and it can lag the
+ * content it belongs to. A write whose confirmation timed out but which landed
+ * anyway leaves this instance holding newer state at an older version — and it
+ * would then adopt its own earlier copy back over that state, forgetting a
+ * patient it registered or a booking it made.
+ *
+ * So the version proposes and the content vetoes: a copy that has fewer
+ * messages, or fewer appointments booked, than what we already hold is not an
+ * advance whatever it claims. Both lists only ever grow within a run.
+ */
+function notBehind(
+  restored: { session: Session; messages: ModelMessage[] },
+  run: Run,
+): boolean {
+  return (
+    restored.messages.length >= run.messages.length &&
+    restored.session.booked.length >= run.session.booked.length
+  );
 }
 
 /* ------------------------------------------------------------------ *

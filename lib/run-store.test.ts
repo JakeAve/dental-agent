@@ -119,7 +119,14 @@ describe('getRun', () => {
     const adopted = getRun('r1', HISTORY, {
       seq: 3,
       session: stored({ id: 'p1', name: 'Dana Reed', status: 'returning' }, true),
-      messages: [{ role: 'user', content: 'yes, book the 3pm' }],
+      messages: [
+        ...HISTORY.map((h) => ({
+          role: h.role === 'patient' ? 'user' : 'assistant',
+          content: h.content,
+        })),
+        { role: 'user', content: 'yes, book the 3pm' },
+        { role: 'assistant', content: 'Booked — Thursday at 3pm with Dr Chen.' },
+      ],
     });
 
     expect(adopted.session.booked).toHaveLength(1);
@@ -142,6 +149,39 @@ describe('getRun', () => {
     expect(run.seq).toBe(0);
     // And so its write is the one the store refuses, not the other way round.
     expect(serializeRun(run).seq).toBeLessThan(7);
+  });
+
+  /**
+   * The version orders writes but does not prove content, and it can lag the
+   * content it belongs to: a write whose confirmation timed out yet landed
+   * leaves this instance newer than its own published version. Adopting on the
+   * version alone would then hand back its own earlier copy and forget the
+   * booking it had just made.
+   */
+  it('refuses to adopt a copy that holds less than it does', () => {
+    const run = getRun('r1', HISTORY);
+    run.session.patient = { id: 'p1', name: 'Dana Reed', status: 'returning' };
+    run.session.booked = [
+      {
+        id: 'a1',
+        service: 'Cleaning',
+        startsAtUtc: '2026-08-03T15:00:00Z',
+        provider: 'Dr Chen',
+        price: 'Self-pay. Patient owes $125.00.',
+      },
+    ];
+    run.messages.push({ role: 'assistant', content: 'Booked.' });
+
+    const kept = getRun('r1', HISTORY, {
+      // Higher version, but it is our own earlier copy: no booking, one message
+      // fewer. An advance in name only.
+      seq: 99,
+      session: stored({ id: 'p1', name: 'Dana Reed', status: 'returning' }),
+      messages: [{ role: 'user', content: 'I need a cleaning.' }],
+    });
+
+    expect(kept.session.booked).toHaveLength(1);
+    expect(kept.messages).toHaveLength(3);
   });
 
   it('advances its version only once a publish has landed', () => {
