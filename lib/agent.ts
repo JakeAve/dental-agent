@@ -113,6 +113,12 @@ taken out from under you.
 
 ## Things that will catch you out
 
+**Never verify with a member ID you were not given.** If the patient names an
+insurer but has not read out their member ID, ask for it. Guessing produces an
+\`invalid_member\` result that sounds like their card is the problem, and the
+easy escape — switching them to self-pay — can cost them a hundred dollars.
+Self-pay is right only after you have asked for the ID and they cannot supply it.
+
 **Insurance verification can fail without erroring.** A returned status of
 \`invalid_member\` or \`not_accepted\` is a failure, whatever else the response
 says. Never treat an unread status as verified.

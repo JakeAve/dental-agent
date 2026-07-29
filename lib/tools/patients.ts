@@ -265,13 +265,24 @@ export function patientTools(api: CedarRidgeClient, session: Session) {
             };
           }
 
-          if (!payer || !memberId) {
+          // A member ID the patient never gave is worse than no attempt: it
+          // comes back `invalid_member`, which reads like *their* card is bad,
+          // and the usual next move is self-pay — quietly costing them the
+          // difference between a copay and the full price.
+          const looksReal = !!memberId && /^[a-z0-9-]{6,}$/i.test(memberId.trim());
+
+          if (!payer || !looksReal) {
             return {
               status: 'incomplete' as const,
               settled: false,
               note:
-                'Need both the insurer and the member ID to verify. Ask the ' +
-                'patient for the member ID on their card, or offer self-pay.',
+                'Not enough to verify, and nothing was sent to the insurer. ' +
+                (payer && !memberId
+                  ? `Ask the patient for their ${payer} member ID — the number ` +
+                    'on their card. Do not guess it, and do not move them to ' +
+                    'self-pay until you have asked for it at least once.'
+                  : 'Ask the patient which insurer they have and for the member ' +
+                    'ID on their card, or offer self-pay if they have neither.'),
             };
           }
 
