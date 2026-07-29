@@ -1,5 +1,11 @@
 import { Redis } from '@upstash/redis';
-import { LOCK_TTL_MS, RUN_TTL_MS, TURN_WAIT_DEADLINE_MS, TURN_WAIT_POLL_MS } from './config';
+import {
+  LOCK_TTL_MS,
+  REDIS_OP_TIMEOUT_MS,
+  RUN_TTL_MS,
+  TURN_WAIT_DEADLINE_MS,
+  TURN_WAIT_POLL_MS,
+} from './config';
 import type { PersistedRun, Turn } from './run-store';
 
 /**
@@ -39,8 +45,11 @@ export type SharedStore = {
   claimTurn(runId: string, turnId: string): Promise<boolean>;
   /** Publish a finished turn for every other instance to replay. */
   saveTurn(runId: string, turnId: string, turn: Turn): Promise<void>;
-  /** Poll for the claim winner's result; null once the deadline passes. */
-  awaitTurn(runId: string, turnId: string): Promise<Turn | null>;
+  /**
+   * Poll for the claim winner's result; null once the deadline passes.
+   * `budgetMs` caps the wait at what the request has left to spend.
+   */
+  awaitTurn(runId: string, turnId: string, budgetMs?: number): Promise<Turn | null>;
   /** Free a failed turn's claim so a retry gets a real attempt. */
   releaseTurn(runId: string, turnId: string): Promise<void>;
   /**
@@ -58,6 +67,23 @@ const runKey = (runId: string) => `dental-agent:run:${runId}`;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Fails a call that has taken too long, so the caller's fail-open path runs.
+ *
+ * The timer is cleared either way: a pending one keeps the serverless process
+ * alive past the response for no reason.
+ */
+function withTimeout<T>(work: Promise<T>, ms: number, op: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+
+  return Promise.race([
+    work,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${op} exceeded ${ms}ms`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+
 function warn(op: string, err: unknown) {
   // Message only — never key material, and Redis errors can echo commands.
   console.warn(
@@ -67,14 +93,23 @@ function warn(op: string, err: unknown) {
 
 export function createSharedStore(
   redis: RedisLike,
-  opts: { pollIntervalMs?: number; waitDeadlineMs?: number } = {},
+  opts: {
+    pollIntervalMs?: number;
+    waitDeadlineMs?: number;
+    opTimeoutMs?: number;
+  } = {},
 ): SharedStore {
   const pollIntervalMs = opts.pollIntervalMs ?? TURN_WAIT_POLL_MS;
   const waitDeadlineMs = opts.waitDeadlineMs ?? TURN_WAIT_DEADLINE_MS;
+  const opTimeoutMs = opts.opTimeoutMs ?? REDIS_OP_TIMEOUT_MS;
+
+  /** Bounded, and failing open on the timeout exactly as on an outage. */
+  const bounded = <T>(op: string, work: () => Promise<T>) =>
+    withTimeout(work(), opTimeoutMs, op);
 
   const getTurn = async (runId: string, turnId: string) => {
     try {
-      return await redis.get<Turn>(turnKey(runId, turnId));
+      return await bounded('getTurn', () => redis.get<Turn>(turnKey(runId, turnId)));
     } catch (err) {
       warn('getTurn', err);
       return null;
@@ -89,10 +124,9 @@ export function createSharedStore(
         // The lock outlives the evaluator's timeout so a finished turn cannot
         // be claimed again the moment it completes; it expires on its own if
         // the winner dies without saving or releasing.
-        const won = await redis.set(lockKey(runId, turnId), '1', {
-          nx: true,
-          px: LOCK_TTL_MS,
-        });
+        const won = await bounded('claimTurn', () =>
+          redis.set(lockKey(runId, turnId), '1', { nx: true, px: LOCK_TTL_MS }),
+        );
         return won !== null;
       } catch (err) {
         warn('claimTurn', err);
@@ -102,14 +136,19 @@ export function createSharedStore(
 
     async saveTurn(runId, turnId, turn) {
       try {
-        await redis.set(turnKey(runId, turnId), turn, { px: RUN_TTL_MS });
+        await bounded('saveTurn', () =>
+          redis.set(turnKey(runId, turnId), turn, { px: RUN_TTL_MS }),
+        );
       } catch (err) {
         warn('saveTurn', err);
       }
     },
 
-    async awaitTurn(runId, turnId) {
-      const deadline = Date.now() + waitDeadlineMs;
+    async awaitTurn(runId, turnId, budgetMs) {
+      // Whichever is shorter: this store's ceiling, or what the request has
+      // left. Polling past the evaluator's limit turns a turn another instance
+      // is about to answer into a failed run.
+      const deadline = Date.now() + Math.min(waitDeadlineMs, budgetMs ?? waitDeadlineMs);
       while (Date.now() < deadline) {
         const turn = await getTurn(runId, turnId);
         if (turn) return turn;
@@ -120,7 +159,7 @@ export function createSharedStore(
 
     async releaseTurn(runId, turnId) {
       try {
-        await redis.del(lockKey(runId, turnId));
+        await bounded('releaseTurn', () => redis.del(lockKey(runId, turnId)));
       } catch (err) {
         warn('releaseTurn', err);
       }
@@ -128,7 +167,7 @@ export function createSharedStore(
 
     async loadRun(runId) {
       try {
-        return await redis.get<unknown>(runKey(runId));
+        return await bounded('loadRun', () => redis.get<unknown>(runKey(runId)));
       } catch (err) {
         warn('loadRun', err);
         return null;
@@ -140,7 +179,9 @@ export function createSharedStore(
         // Last write wins. The evaluator drives one turn at a time per run, so
         // concurrent writers are retries of the same turn converging on the
         // same state rather than two different conversations racing.
-        await redis.set(runKey(runId), run, { px: RUN_TTL_MS });
+        await bounded('saveRun', () =>
+          redis.set(runKey(runId), run, { px: RUN_TTL_MS }),
+        );
       } catch (err) {
         warn('saveRun', err);
       }
@@ -161,6 +202,21 @@ export function sharedStoreFromEnv(): SharedStore | null {
   const url = process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN;
 
-  cached = url && token ? createSharedStore(new Redis({ url, token })) : null;
+  cached =
+    url && token
+      ? createSharedStore(
+          new Redis({
+            url,
+            token,
+            // One quick retry, not the default five with exponential backoff,
+            // which is upwards of ten seconds of sleeping inside a
+            // twenty-second turn. The per-call timeout already stops us
+            // *waiting* on that; what it cannot stop is the abandoned call
+            // carrying on retrying, on an instance that is trying to finish a
+            // response. A turn that proceeds without the shared store works.
+            retry: { retries: 1, backoff: () => 100 },
+          }),
+        )
+      : null;
   return cached;
 }

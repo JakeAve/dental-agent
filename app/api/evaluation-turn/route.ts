@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import { runAgentOnce } from '@/lib/agent';
 import { createClient } from '@/lib/cedar-ridge';
-import { PRACTICE, PROTOCOL_VERSION, TURN_DEADLINE_MS } from '@/lib/config';
+import { agentBudgetMs, waitBudgetMs } from '@/lib/budget';
+import { PRACTICE, PROTOCOL_VERSION } from '@/lib/config';
 import { sharedStoreFromEnv } from '@/lib/idempotency';
 import { getRun, peekRun, serializeRun, type Turn } from '@/lib/run-store';
 import { collapseRestartedReply } from '@/lib/reply';
@@ -74,6 +75,19 @@ function reply(body: unknown, status = 200) {
 }
 
 export async function POST(req: Request) {
+  /**
+   * One clock for the whole request, started before anything else happens.
+   *
+   * The protocol's twenty seconds are counted from when the evaluator sends,
+   * not from when the model starts, and everything between the two costs real
+   * time: parsing, three shared-store round trips, then two writes on the way
+   * out. Timing only the agent is how a request that looks well inside budget
+   * exceeds it — and a timeout is not a lost turn, it ends the whole run as an
+   * endpoint failure.
+   */
+  const startedAt = Date.now();
+  const elapsed = () => Date.now() - startedAt;
+
   // Optional shared secret, if the interviewer configures one.
   const expected = process.env.AGENT_BEARER_TOKEN;
   if (expected && req.headers.get('authorization') !== `Bearer ${expected}`) {
@@ -130,7 +144,10 @@ export async function POST(req: Request) {
 
     if (!(await shared.claimTurn(run_id, turn_id))) {
       // Another instance is executing this turn right now.
-      const won = await shared.awaitTurn(run_id, turn_id);
+      // Bounded by what is left of the request, not by a fixed wait: this
+      // instance has already spent time getting here, and the winner's answer
+      // is worthless if we hand it over after the evaluator has given up.
+      const won = await shared.awaitTurn(run_id, turn_id, waitBudgetMs(elapsed()));
       if (won) local?.turns.set(turn_id, won);
       return reply(
         envelope(
@@ -166,7 +183,10 @@ export async function POST(req: Request) {
    * model stops taking steps, and the in-flight request is dropped with it.
    */
   const control = new AbortController();
-  const deadline = setTimeout(() => control.abort(), TURN_DEADLINE_MS);
+
+  // Whatever the request has left once the writes still to come are set aside.
+  const agentBudget = agentBudgetMs(elapsed());
+  const deadline = setTimeout(() => control.abort(), agentBudget);
 
   const work = (async (): Promise<Turn> => {
     // Built beside the run rather than pushed into it. A turn that fails must
@@ -248,7 +268,7 @@ export async function POST(req: Request) {
     // request, and a leaked message is a scored failure.
     console.error(
       `[evaluation-turn] run=${run_id} turn=${turn_id} ` +
-        `${control.signal.aborted ? `exceeded ${TURN_DEADLINE_MS}ms` : 'failed'}:`,
+        `${control.signal.aborted ? `exceeded ${agentBudget}ms` : 'failed'}:`,
       err instanceof Error ? err.message : 'unknown error',
     );
     turn = { message: FALLBACK, status: 'continue' };

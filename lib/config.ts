@@ -33,14 +33,37 @@ export const STEP_BUDGET = 16;
 
 export const PROTOCOL_VERSION = 'candidate-agent/1';
 
-/** The evaluator's own limit. We must answer inside this or the run errors. */
+/**
+ * The evaluator's own limit. We must answer inside this or the run errors —
+ * and not merely this turn: a timeout is scored as a candidate-endpoint
+ * failure, which ends the whole run however well the booking went.
+ */
 export const EVALUATOR_TIMEOUT_MS = 20_000;
 
 /**
- * Our internal deadline, with headroom inside the evaluator's limit so we
- * answer with a real sentence rather than hanging and failing the turn.
+ * What one request may spend end to end, measured from the moment it arrives.
+ *
+ * Everything else here is carved out of this rather than added to it. Budgets
+ * that each look safe alone are how a request quietly exceeds the evaluator's
+ * limit: the agent's deadline, the shared-store reads before it and the writes
+ * after it are all real wall clock on the same twenty seconds.
+ */
+export const REQUEST_BUDGET_MS = 18_000;
+
+/**
+ * Ceiling on agent work. The real deadline is whatever is left of
+ * `REQUEST_BUDGET_MS` when the model starts, which is normally this.
  */
 export const TURN_DEADLINE_MS = 16_000;
+
+/**
+ * The least agent time worth starting on.
+ *
+ * Below this the turn cannot reach a useful answer, and spending the last of
+ * the budget trying is how a slow request becomes a failed run instead of a
+ * graceful apology.
+ */
+export const MIN_AGENT_MS = 2_000;
 
 // Note: route `maxDuration` deliberately lives as a literal in each route file.
 // Next analyses segment config statically and rejects imported values.
@@ -60,11 +83,23 @@ export const LOCK_TTL_MS = EVALUATOR_TIMEOUT_MS + 5_000;
 export const TURN_WAIT_POLL_MS = 400;
 
 /**
- * How long a losing instance waits before answering with the fallback.
- * Bounded by the internal turn deadline for the same reason it is: better a
- * real sentence inside the evaluator's limit than a timeout.
+ * Ceiling on how long a losing instance waits for the winner's turn. The
+ * effective wait is whatever is left of the request budget, for the same reason
+ * the agent's deadline is: better a real sentence inside the evaluator's limit
+ * than a timeout that ends the run.
  */
 export const TURN_WAIT_DEADLINE_MS = TURN_DEADLINE_MS;
+
+/**
+ * Hard ceiling on a single shared-store call.
+ *
+ * Upstash retries network failures five times by default, backing off
+ * exponentially — over ten seconds of sleeping inside a twenty-second budget,
+ * spent before the model has been asked anything. Every method here already
+ * fails open, so cutting a slow call short costs the same as an outage: the
+ * per-instance behaviour we had before Redis existed. Waiting does not.
+ */
+export const REDIS_OP_TIMEOUT_MS = 700;
 
 /* ------------------------------------------------------------------ *
  * Run store
