@@ -101,8 +101,15 @@ export function statesAmount(message: string, appt: Appointment): boolean {
 const BOOKED_CLAIM =
   /\b(?:you(?:'re| are) (?:all set|booked|scheduled)|(?:is|are|has been|have been) (?:confirmed|booked|scheduled)|i(?:'ve| have) (?:booked|scheduled|confirmed))\b/i;
 
-/** Anything that flips the claim into a denial — "that has NOT been booked". */
-const NEGATOR = /\b(?:not|n't|no|never|unable|cannot|fail(?:ed)?|couldn)\b/i;
+/**
+ * Anything that flips the claim into a denial — "that has NOT been booked".
+ *
+ * `nothing` and `none` are listed in their own right: `\bno\b` does not match
+ * inside "nothing", so "Nothing has been booked yet" read as a claim until a
+ * test caught it.
+ */
+const NEGATOR =
+  /\b(?:not|n't|no|nothing|none|never|unable|cannot|fail(?:ed)?|couldn)\b/i;
 
 /**
  * Did the agent tell the patient a booking exists?

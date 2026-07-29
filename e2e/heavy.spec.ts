@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
-import { EVALUATOR_TIMEOUT_MS, PRACTICE } from '../lib/config';
+import { EVALUATOR_TIMEOUT_MS } from '../lib/config';
 import { sendTurn } from './support/protocol';
 import { startProxy } from './support/proxy';
 import { AGENT_URL, apiConfig, cleanup } from './support/run';
+import { confirmationMessage } from './support/said';
 import { fetchAppointments } from './support/verify';
 
 /**
@@ -82,16 +83,6 @@ describe('a full booking in one turn', () => {
             `${EVALUATOR_TIMEOUT_MS / 1000}s limit`,
         ).toBeLessThan(EVALUATOR_TIMEOUT_MS);
 
-        // The turn must have finished on its own rather than been rescued by the
-        // internal deadline. The fallback sentence is well-formed and on time,
-        // so only its content distinguishes the two.
-        expect(
-          body.output?.message,
-          `the turn fell back to the front-desk message after ` +
-            `${(elapsed / 1000).toFixed(1)}s — the booking chain did not fit ` +
-            'inside the internal deadline',
-        ).not.toContain(PRACTICE.phone);
-
         // Ground truth: a plausible sentence is not a booking.
         expect(
           proxy.appointmentIds,
@@ -101,6 +92,23 @@ describe('a full booking in one turn', () => {
 
         const [appt] = await fetchAppointments(proxy.appointmentIds);
         expect(appt.status).toBe('confirmed');
+
+        // The turn finished on its own rather than being rescued by the internal
+        // deadline. Stated as positive evidence — the reply names the
+        // appointment that exists — because the deadline's fallback is itself a
+        // well-formed, on-time sentence. Checking for the fallback's words
+        // instead would miss the nastier variant this catches: the booking
+        // landing while the patient is told to ring the office.
+        expect(
+          confirmationMessage(
+            [{ role: 'agent', content: body.output?.message ?? '' }],
+            appt,
+          ),
+          `the booking chain did not report back in ` +
+            `${(elapsed / 1000).toFixed(1)}s. An appointment exists ` +
+            `(${appt.starts_at} UTC with ${appt.provider.name}) but the reply ` +
+            `was: "${body.output?.message}"`,
+        ).toBeDefined();
 
         // Budget discipline, measured where it is worst: the turn that does
         // everything. Static catalogs should be fetched once, not per step.
