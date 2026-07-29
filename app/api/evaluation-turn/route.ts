@@ -3,6 +3,7 @@ import { runAgentOnce } from '@/lib/agent';
 import { createClient } from '@/lib/cedar-ridge';
 import { PRACTICE, PROTOCOL_VERSION, TURN_DEADLINE_MS } from '@/lib/config';
 import { getRun, type Turn } from '@/lib/run-store';
+import { collapseRestartedReply } from '@/lib/reply';
 
 /**
  * The candidate-agent/1 endpoint the evaluator's synthetic patient talks to.
@@ -146,7 +147,12 @@ export async function POST(req: Request) {
       `[evaluation-turn] run=${run_id} turn=${turn_id} tools=[${called.join(', ')}]`,
     );
 
-    let message = result.text.trim();
+    let message = collapseRestartedReply(result.text.trim());
+    if (message !== result.text.trim()) {
+      console.warn(
+        `[evaluation-turn] run=${run_id} turn=${turn_id} collapsed a restarted reply`,
+      );
+    }
     if (!message) {
       console.warn(
         `[evaluation-turn] run=${run_id} turn=${turn_id} empty completion`,
