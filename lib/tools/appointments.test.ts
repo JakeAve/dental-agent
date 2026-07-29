@@ -127,6 +127,22 @@ describe('findAvailability paging', () => {
     expect(session.slotRefs.get(secondRefs[0])?.slotId).toBe('slot-10');
   });
 
+  it('reuses the ref for a slot it has already seen', async () => {
+    const { api } = fakeApi(11);
+    const session = readySession();
+
+    // Re-running the same search — a retry, or a second look at page one after
+    // paging on — must not list the same time twice under two refs.
+    const first = await search(api, session, { service: 'D1110' });
+    await search(api, session, { service: 'D1110', page: 2 });
+    const again = await search(api, session, { service: 'D1110' });
+
+    expect((again.slots as Array<{ ref: string }>).map((s) => s.ref)).toEqual(
+      (first.slots as Array<{ ref: string }>).map((s) => s.ref),
+    );
+    expect(session.slotRefs.size).toBe(20);
+  });
+
   it('drops stale refs when the search itself changes', async () => {
     const { api } = fakeApi(11);
     const session = readySession();

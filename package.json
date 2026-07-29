@@ -8,11 +8,12 @@
     "start": "next start",
     "lint": "eslint",
     "smoke": "tsx --env-file=.env scripts/smoke.ts",
-    "e2e": "vitest run",
-    "e2e:smoke": "vitest run e2e/protocol.spec.ts",
-    "e2e:core": "vitest run e2e/protocol.spec.ts e2e/outcomes.spec.ts",
-    "e2e:full": "vitest run",
-    "e2e:watch": "vitest",
+    "test:unit": "vitest run --project unit",
+    "e2e": "vitest run --project e2e",
+    "e2e:smoke": "vitest run --project e2e e2e/protocol.spec.ts",
+    "e2e:core": "vitest run --project e2e e2e/protocol.spec.ts e2e/outcomes.spec.ts",
+    "e2e:full": "vitest run --project e2e",
+    "e2e:watch": "vitest --project e2e",
     "e2e:cleanup": "tsx --env-file=.env scripts/e2e-cleanup.ts"
   },
   "dependencies": {

@@ -146,12 +146,16 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
             };
           }
 
-          // Read once: the map writes as it goes, so reading size per iteration
-          // would number the refs 1, 3, 5 and collide with the next page.
-          const refBase = slotRefs.size;
+          // A slot keeps the ref it was first given. Pages of one search can
+          // overlap, and the same page may be fetched twice — either way the
+          // patient must not hear the same time offered under two refs.
+          const refFor = new Map(
+            [...slotRefs].map(([ref, slot]) => [slot.slotId, ref]),
+          );
+          let nextRef = slotRefs.size;
 
-          const slots = result.availability.map((s, i) => {
-            const ref = String(refBase + i + 1);
+          const slots = result.availability.map((s) => {
+            const ref = refFor.get(s.slot_id) ?? String(++nextRef);
             slotRefs.set(ref, { slotId: s.slot_id, startsAtUtc: s.starts_at });
 
             return {
