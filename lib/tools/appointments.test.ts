@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { CedarRidgeError, type CedarRidgeClient } from '../cedar-ridge';
+import { WIDENED_SEARCH_DAYS } from '../config';
 import { createSession, type Session } from '../session';
+import { addDays, practiceDate } from '../time';
 import { appointmentTools } from './appointments';
 
 /**
@@ -185,14 +187,17 @@ describe('findAvailability paging', () => {
     expect(result.guidance).toMatch(/page/i);
   });
 
-  it('still suggests widening when the window itself is empty', async () => {
-    const { api } = fakeApi(0);
+  it('reports a genuinely empty window as empty, having already widened it', async () => {
+    const { api, calls } = fakeApi(0);
     const session = readySession();
 
     const result = await search(api, session, { service: 'D1110' });
 
     expect(result.slots).toEqual([]);
-    expect(result.guidance).toMatch(/30 to 60 days/);
+    // Widened once, automatically, and the guidance must not send the model
+    // round again to widen a window that has already been widened.
+    expect(calls).toHaveLength(2);
+    expect(result.guidance).toMatch(/already widened/i);
   });
 
   it('leaves earlier refs alone when a later page comes back empty', async () => {
@@ -356,5 +361,108 @@ describe('a confirmation that was never answered', () => {
     // out of booking the slot the patient actually chose.
     expect(result.ok).toBe(false);
     expect(session.pendingConfirm).toBeUndefined();
+  });
+});
+
+
+/**
+ * The old answer to an empty window was a paragraph asking the model to search
+ * again over 30 to 60 days. It usually did — and "usually" is the problem,
+ * because the cost of forgetting is telling a patient the practice is full when
+ * it has openings all month. WIDENED_SEARCH_DAYS existed as a constant and was
+ * referenced nowhere.
+ */
+
+/** Empty inside the default window, with openings further out. */
+function fakeSparseApi(openFrom: string) {
+  const calls: Array<{ from?: string; to?: string; page?: number }> = [];
+
+  const api = {
+    getAvailability: async (params: { from?: string; to?: string; page?: number }) => {
+      calls.push({ from: params.from, to: params.to, page: params.page });
+
+      // An omitted `to` is not an unbounded window: the API defaults to
+      // fourteen days, which is the whole reason an empty first search is worth
+      // retrying wider.
+      const reaches = (params.to ?? addDays(practiceDate(), 14)) >= openFrom;
+
+      return {
+        availability: reaches ? [slot(1, `${openFrom}T15:00:00Z`)] : [],
+        page: params.page ?? 1,
+        total_pages: reaches ? 1 : 0,
+      };
+    },
+  } as unknown as CedarRidgeClient;
+
+  return { api, calls };
+}
+
+describe('an empty window widens itself', () => {
+  const wide = addDays(practiceDate(), WIDENED_SEARCH_DAYS);
+
+  it('retries once at the widened window and returns what it finds', async () => {
+    const { api, calls } = fakeSparseApi(addDays(practiceDate(), 40));
+    const session = readySession();
+
+    const result = await search(api, session, { service: 'D1110' });
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toMatchObject({ from: undefined, to: undefined });
+    expect(calls[1]).toMatchObject({ from: practiceDate(), to: wide });
+    expect(result.slots).toHaveLength(1);
+  });
+
+  it('says the times are not from the window that was asked for', async () => {
+    const { api } = fakeSparseApi(addDays(practiceDate(), 40));
+    const session = readySession();
+
+    const result = await search(api, session, {
+      service: 'D1110',
+      from: practiceDate(),
+      to: addDays(practiceDate(), 3),
+    });
+
+    // Offering them as though they were what was asked for is the failure this
+    // wording exists to prevent.
+    expect(result.guidance).toMatch(/widened/i);
+    expect(result.searchedTo).toBe(wide);
+  });
+
+  it('does not widen a window that is already wider', async () => {
+    const { api, calls } = fakeSparseApi(addDays(practiceDate(), 400));
+    const session = readySession();
+
+    await search(api, session, {
+      service: 'D1110',
+      from: practiceDate(),
+      to: addDays(practiceDate(), 90),
+    });
+
+    expect(calls).toHaveLength(1);
+  });
+
+  it('does not widen when a later page runs out, which is not a window problem', async () => {
+    const { api, calls } = fakeApi(4);
+    const session = readySession();
+
+    await search(api, session, { service: 'D1110', page: 9 });
+
+    expect(calls).toHaveLength(1);
+  });
+
+  it('files the refs under the window that actually produced them', async () => {
+    const { api } = fakeSparseApi(addDays(practiceDate(), 40));
+    const session = readySession();
+
+    await search(api, session, { service: 'D1110' });
+
+    // Searching that same widened window again must be recognised as the same
+    // search, or the refs the patient is choosing from get cleared underneath
+    // them.
+    expect(session.slotSearch).toBe(`D1110|${practiceDate()}|${wide}`);
+
+    const refs = [...session.slotRefs.keys()];
+    await search(api, session, { service: 'D1110', from: practiceDate(), to: wide });
+    expect([...session.slotRefs.keys()]).toEqual(refs);
   });
 });

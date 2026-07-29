@@ -17,6 +17,7 @@ import {
   type Session,
   type SessionSnapshot,
 } from './session';
+import { practiceDate } from './time';
 import { practiceTools } from './tools/practice';
 import { patientTools } from './tools/patients';
 import { appointmentTools } from './tools/appointments';
@@ -47,7 +48,12 @@ export type AgentMessage = UIMessage<never, AgentDataTypes, AgentTools>;
 function systemPrompt(now: Date, session: Session) {
   // The model has no clock. Without this it guesses at "next Tuesday" and books
   // the wrong week.
-  const today = now.toISOString().slice(0, 10);
+  //
+  // The practice's calendar day, not UTC's. For the six or seven hours a day
+  // they disagree this was the only machine-formatted date in the prompt and so
+  // the one the model copied into from/to — searching an evening caller's
+  // availability from tomorrow.
+  const today = practiceDate(now);
   const localNow = new Intl.DateTimeFormat('en-US', {
     timeZone: PRACTICE.timezone,
     dateStyle: 'full',
@@ -62,7 +68,7 @@ The office is at ${PRACTICE.address}. Its phone number is ${PRACTICE.phone} —
 use that exact number whenever you refer someone to the front desk, and never a
 placeholder.
 
-Right now it is ${localNow} at the practice (${today} in UTC). Resolve relative
+Right now it is ${localNow} at the practice — ${today} as a date. Resolve relative
 dates — "next Tuesday", "in two weeks" — against that, and say the resolved date
 back to the patient so they can catch a misunderstanding.
 

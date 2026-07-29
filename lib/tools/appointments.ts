@@ -1,8 +1,9 @@
 import { tool } from 'ai';
 import { z } from 'zod';
 import { CedarRidgeError, type Appointment, type CedarRidgeClient } from '../cedar-ridge';
+import { WIDENED_SEARCH_DAYS } from '../config';
 import { insuranceBlocks, type Session } from '../session';
-import { partOfDay, toPracticeTime } from '../time';
+import { addDays, partOfDay, practiceDate, toPracticeTime } from '../time';
 import { withRecovery } from './errors';
 
 /** Money comes back from the API in cents; never let the model divide. */
@@ -93,7 +94,8 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
         'Results are chronological and come ten at a time, so the first page of ' +
         'a wide window may only reach a day or two in: to find a time later in ' +
         'the window, either narrow from/to onto the days the patient wants or ' +
-        'ask for the next page.',
+        'ask for the next page. An empty window is widened automatically, so ' +
+        'an empty result really means empty.',
       inputSchema: z.object({
         service: z.string().describe('A service code from listServices, e.g. D1110'),
         from: z.string().optional().describe('YYYY-MM-DD, defaults to today'),
@@ -128,18 +130,44 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
             };
           }
 
-          const result = await api.getAvailability({
-            service,
-            patient_id: session.patient.id,
-            from,
-            to,
-            page,
-          });
+          const search = (window: { from?: string; to?: string }) =>
+            api.getAvailability({
+              service,
+              patient_id: session.patient!.id,
+              from: window.from,
+              to: window.to,
+              page,
+            });
+
+          let result = await search({ from, to });
+          let searched = { from, to };
+          let widened = false;
+
+          // An empty first page used to be answered with a paragraph asking the
+          // model to search again over 30 to 60 days. It usually did. "Usually"
+          // is the problem: the cost of forgetting is telling a patient the
+          // practice is full when it has openings all month, and one extra call
+          // buys the certainty. Only from the first page, because a later page
+          // coming back empty means the window ran out of pages, not of days.
+          if (result.availability.length === 0 && (page ?? 1) === 1) {
+            const wideFrom = from ?? practiceDate();
+            const wideTo = addDays(wideFrom, WIDENED_SEARCH_DAYS);
+
+            // Skipped when the caller already asked for at least this much: a
+            // repeat of the same search would spend a call to learn nothing.
+            if (!to || to < wideTo) {
+              widened = true;
+              searched = { from: wideFrom, to: wideTo };
+              result = await search(searched);
+            }
+          }
 
           // Paging within one search accumulates refs; changing the search
           // discards them, because the patient is no longer being offered those
-          // times. Keyed on the window rather than the page for that reason.
-          const searchKey = `${service}|${from ?? ''}|${to ?? ''}`;
+          // times. Keyed on the window actually searched, not the one asked
+          // for, or a widened search's refs would be filed under a window that
+          // never produced them.
+          const searchKey = `${service}|${searched.from ?? ''}|${searched.to ?? ''}`;
           if (session.slotSearch !== searchKey) {
             slotRefs.clear();
             session.slotSearch = searchKey;
@@ -154,8 +182,9 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
               slots: [],
               page: result.page,
               totalPages: result.total_pages,
-              searchedFrom: from ?? 'today',
-              searchedTo: to ?? '14 days out (the default)',
+              searchedFrom: searched.from ?? 'today',
+              searchedTo: searched.to ?? '14 days out (the default)',
+              widenedTo: widened ? `${WIDENED_SEARCH_DAYS} days` : undefined,
               guidance:
                 // An empty first page means an empty window whatever the page
                 // count says; only a later page can have run off the end.
@@ -164,11 +193,14 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
                     `${result.total_pages}. The times you already fetched are ` +
                     'still on offer; go back to an earlier page, or search a ' +
                     'different window.'
-                  : 'Nothing open in that window. This is common for new ' +
-                    'patients, whose visits are long and whose openings are ' +
-                    'scarce — it does not mean the practice is full. Search ' +
-                    'again with a window of at least 30 to 60 days before ' +
-                    'telling the patient there is nothing available.',
+                  : widened
+                    ? `Nothing open in the next ${WIDENED_SEARCH_DAYS} days — ` +
+                      'this search was already widened to that automatically, so ' +
+                      'widening again will return the same nothing. This is a ' +
+                      'real dead end: say so, and offer the office number.'
+                    : 'Nothing open in that window, and it was not widened ' +
+                      'because you asked for a wider one already. Say so plainly ' +
+                      'rather than searching it again.',
             };
           }
 
@@ -197,7 +229,19 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
             slots,
             page: result.page,
             totalPages: result.total_pages,
+            searchedFrom: searched.from ?? 'today',
+            searchedTo: searched.to ?? '14 days out (the default)',
             guidance:
+              // Said first when it happened, because the patient asked about a
+              // window these times are not in, and hearing them offered as
+              // though they were is worse than hearing the window was empty.
+              (widened
+                ? 'Nothing was open in the window you asked about, so this ' +
+                  `search was widened to the next ${WIDENED_SEARCH_DAYS} days ` +
+                  'automatically. Tell the patient their window had nothing ' +
+                  'and that these are the nearest openings after it — do not ' +
+                  'present them as if they were what was asked for. '
+                : '') +
               'Offer these to the patient by time and provider; the ref is for ' +
               'your own use when calling holdSlot. If the patient stated a ' +
               'time-of-day preference and no slot matches, that is NOT "no ' +

@@ -23,6 +23,41 @@ const longFormat = new Intl.DateTimeFormat('en-US', {
   timeZoneName: 'short',
 });
 
+const isoParts = new Intl.DateTimeFormat('en-US', {
+  timeZone: PRACTICE_TIMEZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+/**
+ * Today at the practice, as YYYY-MM-DD.
+ *
+ * The API's date parameters are calendar days at the office, and the office is
+ * in Denver. A UTC date is a different day there for six or seven hours of
+ * every one — so an evening booking would search from tomorrow, and "next
+ * Tuesday" would resolve a week out from the wrong day. Assembled from parts
+ * rather than sliced off an ISO string for exactly that reason.
+ */
+export function practiceDate(now = new Date()): string {
+  const parts = isoParts.formatToParts(now);
+  const part = (type: string) => parts.find((p) => p.type === type)?.value ?? '';
+  return `${part('year')}-${part('month')}-${part('day')}`;
+}
+
+/**
+ * A calendar day some days after another, as YYYY-MM-DD.
+ *
+ * Plain arithmetic on a date with no time and no zone: the practice's calendar
+ * does not shift because a clock did, and a window that lands a day out because
+ * of a daylight-saving boundary is a window that misses a real opening.
+ */
+export function addDays(isoDate: string, days: number): string {
+  const [year, month, day] = isoDate.split('-').map(Number);
+  const shifted = new Date(Date.UTC(year, month - 1, day + days));
+  return shifted.toISOString().slice(0, 10);
+}
+
 /** "Wednesday, August 5, 2026 at 3:30 PM MDT" */
 export function toPracticeTime(utcIso: string): string {
   const date = new Date(utcIso);
