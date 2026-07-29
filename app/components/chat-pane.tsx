@@ -13,11 +13,21 @@ import { TOOL_LABELS, toolName } from './tool-labels';
  * it belongs in the inspector, not here.
  */
 
+/**
+ * Openers the agent can actually see through to an end.
+ *
+ * "I need to cancel my appointment" used to sit here, and it walked a first-time
+ * visitor straight into the one thing this cannot do: there is no endpoint that
+ * looks a patient's appointments up, so cancelling only reaches one booked in
+ * the conversation you are already having. The agent handles that gracefully —
+ * it says it cannot pull the appointment up and gives out the office number —
+ * but a starter chip is a promise, and that is not one to make first.
+ */
 const OPENERS = [
   'I need to book a cleaning',
   'My tooth has been hurting since Friday',
   'What are your hours?',
-  'I need to cancel my appointment',
+  'Do you take Delta Dental?',
 ];
 
 type Props = {
@@ -108,9 +118,14 @@ function Welcome({
       <p className="font-display text-2xl leading-snug text-ink">
         Hi — how can I help?
       </p>
+      {/*
+        Only what it can do. This said "book, reschedule, or cancel" — there is
+        no reschedule tool at all, and a patient told otherwise spends their
+        first turn asking for something the answer has to walk back.
+      */}
       <p className="mt-2 max-w-sm text-[15px] leading-relaxed text-ink-soft">
-        I can book, reschedule, or cancel an appointment, sort out insurance, or
-        answer questions about the office.
+        I can book an appointment, sort out insurance, and answer questions about
+        the office.
       </p>
 
       <div className="mt-7 flex flex-wrap gap-2">
