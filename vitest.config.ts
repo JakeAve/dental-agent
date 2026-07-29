@@ -7,15 +7,29 @@ if (existsSync('.env')) process.loadEnvFile('.env');
 
 export default defineConfig({
   test: {
-    include: ['e2e/**/*.spec.ts'],
-    globalSetup: ['e2e/globalSetup.ts'],
-    // Serial, deliberately. The sandbox is shared and stateful: personas have
-    // stable identities and a patient may hold only one slot at a time, so
-    // parallel scenarios would contend for both slots and holds.
-    fileParallelism: false,
-    maxConcurrency: 1,
-    testTimeout: 180_000,
-    hookTimeout: 60_000,
     reporters: ['verbose'],
+    projects: [
+      {
+        // Pure logic, no sandbox and no server: milliseconds, runs anywhere.
+        test: {
+          name: 'unit',
+          include: ['lib/**/*.test.ts'],
+        },
+      },
+      {
+        test: {
+          name: 'e2e',
+          include: ['e2e/**/*.spec.ts'],
+          globalSetup: ['e2e/globalSetup.ts'],
+          // Serial, deliberately. The sandbox is shared and stateful: personas
+          // have stable identities and a patient may hold only one slot at a
+          // time, so parallel scenarios would contend for both slots and holds.
+          fileParallelism: false,
+          maxConcurrency: 1,
+          testTimeout: 180_000,
+          hookTimeout: 60_000,
+        },
+      },
+    ],
   },
 });

@@ -39,6 +39,16 @@ export type Session = {
    * so refs that die with the turn make the first hold fail every single time.
    */
   slotRefs: Map<string, { slotId: string; startsAtUtc: string }>;
+  /**
+   * Which search the current refs belong to — service plus window.
+   *
+   * Availability is paginated ten to a page, so one set of options is often
+   * several calls. Refs accumulate across the pages of a single search (the
+   * patient may pick a time from the first page after hearing the second) and
+   * are dropped only when the search changes, because then the earlier refs
+   * point at times no longer on offer.
+   */
+  slotSearch?: string;
   /** The most recent hold. Holds expire after five minutes. */
   hold?: {
     holdId: string;

@@ -6,6 +6,52 @@ import { withRecovery } from './errors';
 
 const dollars = (cents: number) => `$${(cents / 100).toFixed(2)}`;
 
+/**
+ * Reshape a spoken phone number into the `555-555-5555` the API demands.
+ *
+ * Patients say "(555) 555 0142", "5555550142", "+1 555.555.0142". All three are
+ * the same number and all three 422 if passed through, and the model's response
+ * to a 422 is to ask the patient to repeat themselves — which reads as the agent
+ * being unable to understand a normal phone number. Reformatting is safe because
+ * it never changes which digits were given.
+ *
+ * Returns null only when the digits themselves are wrong — too few (a 7-digit
+ * local number) or too many. Those need a question, not a guess: padding or
+ * truncating invents a stranger's number.
+ */
+export function normalizePhone(input: string): string | null {
+  let digits = input.replace(/\D/g, '');
+
+  // A leading country code is noise here — the practice is US-only.
+  if (digits.length === 11 && digits.startsWith('1')) digits = digits.slice(1);
+
+  if (digits.length !== 10) return null;
+
+  return `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6)}`;
+}
+
+/**
+ * Same idea for dates of birth, which the API wants as `YYYY-MM-DD` but patients
+ * give as "8/2/1988". Only unambiguous forms convert; anything else is asked
+ * about rather than guessed at, since a wrong DOB fails insurance verification
+ * in a way that looks like the patient's plan is bad.
+ */
+export function normalizeDateOfBirth(input: string): string | null {
+  const text = input.trim();
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+
+  // US convention: M/D/YYYY. Two-digit years are ambiguous for a DOB (a '55
+  // could be 1955 or 2055), so they are left for the model to ask about.
+  const slashed = text.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/);
+  if (!slashed) return null;
+
+  const [, month, day, year] = slashed;
+  if (Number(month) > 12 || Number(day) > 31) return null;
+
+  return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+}
+
 export function patientTools(api: CedarRidgeClient, session: Session) {
   let payerCache: Array<{ payer_id: string; name: string }> | undefined;
 
@@ -51,8 +97,15 @@ export function patientTools(api: CedarRidgeClient, session: Session) {
           .describe('Whether the patient has been seen at this practice before'),
         first_name: z.string(),
         last_name: z.string(),
-        date_of_birth: z.string().describe('YYYY-MM-DD'),
-        phone: z.string().describe('e.g. 555-123-4567'),
+        date_of_birth: z
+          .string()
+          .describe('However the patient said it — "8/2/1988" is fine'),
+        phone: z
+          .string()
+          .describe(
+            'However the patient said it — "(555) 555 0142", "5555550142" and ' +
+              '"555-555-0142" are all accepted and reformatted for you',
+          ),
         email: z.string(),
         address_line1: z.string().optional().describe('Required for new patients'),
         city: z.string().optional().describe('Required for new patients'),
@@ -83,7 +136,49 @@ export function patientTools(api: CedarRidgeClient, session: Session) {
             };
           }
 
-          const patient = await api.registerPatient(input);
+          // Reformat before POSTing rather than letting the API 422 on a number
+          // that was perfectly clear.
+          const phone = normalizePhone(input.phone);
+          const emergencyPhone = input.emergency_contact_phone
+            ? normalizePhone(input.emergency_contact_phone)
+            : undefined;
+          const dateOfBirth = normalizeDateOfBirth(input.date_of_birth);
+
+          const unclear = [
+            !phone &&
+              `The phone number "${input.phone}" is not a complete 10-digit ` +
+                'number. Ask the patient for the full number including area ' +
+                'code. Do not add or drop digits yourself.',
+            input.emergency_contact_phone &&
+              !emergencyPhone &&
+              `The emergency contact number ` +
+                `"${input.emergency_contact_phone}" is not a complete 10-digit ` +
+                'number. Ask for the full number including area code.',
+            !dateOfBirth &&
+              `The date of birth "${input.date_of_birth}" could not be read ` +
+                'unambiguously. Ask the patient to give the month, day, and ' +
+                'four-digit year.',
+          ].filter((x): x is string => typeof x === 'string');
+
+          if (unclear.length || !phone || !dateOfBirth) {
+            return {
+              status: 'incomplete_details' as const,
+              registered: false,
+              askFor: unclear,
+              note:
+                'No record was created. Ask the patient for the values above ' +
+                'and call registerPatient again. Never invent digits.',
+            };
+          }
+
+          const patient = await api.registerPatient({
+            ...input,
+            phone,
+            date_of_birth: dateOfBirth,
+            ...(emergencyPhone
+              ? { emergency_contact_phone: emergencyPhone }
+              : {}),
+          });
 
           session.patient = {
             id: patient.id,

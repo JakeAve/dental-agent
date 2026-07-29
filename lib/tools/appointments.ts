@@ -63,7 +63,11 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
         'for new versus returning patients — new patients need much longer ' +
         'visits and therefore have far fewer openings. Never propose a time ' +
         'that did not come from this tool. Times come back already converted to ' +
-        "the practice's local timezone; read them back exactly as given.",
+        "the practice's local timezone; read them back exactly as given. " +
+        'Results are chronological and come ten at a time, so the first page of ' +
+        'a wide window may only reach a day or two in: to find a time later in ' +
+        'the window, either narrow from/to onto the days the patient wants or ' +
+        'ask for the next page.',
       inputSchema: z.object({
         service: z.string().describe('A service code from listServices, e.g. D1110'),
         from: z.string().optional().describe('YYYY-MM-DD, defaults to today'),
@@ -71,8 +75,18 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
           .string()
           .optional()
           .describe('YYYY-MM-DD, defaults to only 14 days out'),
+        page: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe(
+            'Which page of results, 1 by default. Ten slots a page, earliest ' +
+              'first. Use this to look further into the same window; refs from ' +
+              'pages you already fetched stay valid.',
+          ),
       }),
-      execute: ({ service, from, to }) =>
+      execute: ({ service, from, to, page }) =>
         withRecovery(async () => {
           if (!session.patient) return NO_PATIENT;
 
@@ -93,26 +107,51 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
             patient_id: session.patient.id,
             from,
             to,
+            page,
           });
 
+          // Paging within one search accumulates refs; changing the search
+          // discards them, because the patient is no longer being offered those
+          // times. Keyed on the window rather than the page for that reason.
+          const searchKey = `${service}|${from ?? ''}|${to ?? ''}`;
+          if (session.slotSearch !== searchKey) {
+            slotRefs.clear();
+            session.slotSearch = searchKey;
+          }
+
+          const pagesLeft = result.total_pages - result.page;
+
           if (result.availability.length === 0) {
+            // Two different dead ends, and conflating them sent the agent off to
+            // widen a window that was never the problem.
             return {
               slots: [],
+              page: result.page,
+              totalPages: result.total_pages,
               searchedFrom: from ?? 'today',
               searchedTo: to ?? '14 days out (the default)',
               guidance:
-                'Nothing open in that window. This is common for new patients, ' +
-                'whose visits are long and whose openings are scarce — it does ' +
-                'not mean the practice is full. Search again with a window of ' +
-                'at least 30 to 60 days before telling the patient there is ' +
-                'nothing available.',
+                // An empty first page means an empty window whatever the page
+                // count says; only a later page can have run off the end.
+                result.page > 1 && result.page > result.total_pages
+                  ? `There is no page ${result.page} — this search has ` +
+                    `${result.total_pages}. The times you already fetched are ` +
+                    'still on offer; go back to an earlier page, or search a ' +
+                    'different window.'
+                  : 'Nothing open in that window. This is common for new ' +
+                    'patients, whose visits are long and whose openings are ' +
+                    'scarce — it does not mean the practice is full. Search ' +
+                    'again with a window of at least 30 to 60 days before ' +
+                    'telling the patient there is nothing available.',
             };
           }
 
-          slotRefs.clear();
+          // Read once: the map writes as it goes, so reading size per iteration
+          // would number the refs 1, 3, 5 and collide with the next page.
+          const refBase = slotRefs.size;
 
           const slots = result.availability.map((s, i) => {
-            const ref = String(i + 1);
+            const ref = String(refBase + i + 1);
             slotRefs.set(ref, { slotId: s.slot_id, startsAtUtc: s.starts_at });
 
             return {
@@ -126,14 +165,24 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
 
           return {
             slots,
-            morePages: result.total_pages > result.page,
+            page: result.page,
+            totalPages: result.total_pages,
             guidance:
               'Offer these to the patient by time and provider; the ref is for ' +
               'your own use when calling holdSlot. If the patient stated a ' +
               'time-of-day preference and no slot matches, that is NOT "no ' +
               'availability": say their preferred window is not open, offer the ' +
               'closest actual times, and let them choose. A preference is never ' +
-              'a reason to withhold a real opening or to escalate.',
+              'a reason to withhold a real opening or to escalate.' +
+              (pagesLeft > 0
+                ? ` These are the earliest ${slots.length} of this window, and ` +
+                  `${pagesLeft} more page(s) follow — so this is NOT the whole ` +
+                  'schedule. If the patient wants a day or a time of day that is ' +
+                  'not here, do not tell them it is unavailable: search again ' +
+                  'with from/to narrowed onto the days they asked about (one ' +
+                  'call, and the most precise option), or fetch the next page. ' +
+                  'Refs you already have stay valid either way.'
+                : ' This is the last page of this window.'),
           };
         }, 'findAvailability'),
     }),
