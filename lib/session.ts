@@ -58,6 +58,28 @@ export type Session = {
     startsAtUtc: string;
     expiresAtMs: number;
   };
+  /**
+   * A confirmation we sent and never saw the answer to.
+   *
+   * The turn deadline can fire while `POST /appointments` is in flight. The
+   * request is not cancelled at the far end, so the appointment may well exist
+   * while nothing here records it — and the id lives only in the response we
+   * never read. Left unmarked, the next turn sees a hold and no booking and
+   * books again, which is the duplicate the protocol names outright.
+   *
+   * Confirming the same hold twice is idempotent by the API's own contract:
+   * "200 returns the appointment already created for that hold". So the hold id
+   * is kept precisely so it can be sent again, which either recovers the
+   * appointment or proves it never existed.
+   *
+   * Cleared as soon as any answer arrives, success or error. An error is still
+   * an answer — the ambiguity this exists for is silence.
+   */
+  pendingConfirm?: {
+    holdId: string;
+    service: string;
+    startsAtUtc: string;
+  };
   booked: Array<{
     id: string;
     service: string;
@@ -130,6 +152,13 @@ const persistedSession = z.object({
       expiresAtMs: z.number(),
     })
     .optional(),
+  pendingConfirm: z
+    .object({
+      holdId: z.string(),
+      service: z.string(),
+      startsAtUtc: z.string(),
+    })
+    .optional(),
   booked: z.array(
     z.object({
       id: z.string(),
@@ -160,6 +189,7 @@ export function serializeSession(session: Session): PersistedSession {
     slotRefs: [...session.slotRefs],
     slotSearch: session.slotSearch,
     hold: session.hold,
+    pendingConfirm: session.pendingConfirm,
     booked: session.booked,
     resolved: session.resolved,
   };
@@ -284,6 +314,21 @@ export function describeSession(session: Session, now = new Date()): string {
           'a working member ID or agree to self-pay before you can search times.',
       );
     }
+  }
+
+  // Before the hold, and instead of it: an unanswered confirmation is the one
+  // state where "take a fresh hold" is the wrong move, so it must not be read
+  // after a line that says to.
+  if (session.pendingConfirm && !session.booked.length) {
+    lines.push(
+      `A booking for ${toPracticeTime(session.pendingConfirm.startsAtUtc)} was ` +
+        'already submitted and the answer never came back, so it may or may ' +
+        'not exist. Call confirmAppointment again NOW, before anything else: ' +
+        'sending the same hold twice is safe and returns the appointment if it ' +
+        'was created. Do NOT search times, do NOT take another hold, and do ' +
+        'NOT tell the patient anything about their appointment until it ' +
+        'answers — a second booking is far worse than a slow one.',
+    );
   }
 
   if (session.hold) {

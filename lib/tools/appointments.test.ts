@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { CedarRidgeClient } from '../cedar-ridge';
+import { CedarRidgeError, type CedarRidgeClient } from '../cedar-ridge';
 import { createSession, type Session } from '../session';
 import { appointmentTools } from './appointments';
 
@@ -207,5 +207,154 @@ describe('findAvailability paging', () => {
     // Running off the end must not strand the times already on offer.
     expect(session.slotRefs.get(firstRefs[0])?.slotId).toBe('slot-0');
     expect(session.slotRefs.size).toBe(10);
+  });
+});
+
+/**
+ * The duplicate booking the protocol names outright, and the narrowest way in.
+ *
+ * `POST /appointments` is not cancelled at the far end when the turn's deadline
+ * fires, so the appointment can exist while nothing here records it — its id
+ * lives only in a response nobody read, and there is no endpoint that lists a
+ * patient's appointments. The only recovery is the API's own idempotency:
+ * confirming the same hold again returns the appointment already created for it.
+ */
+
+/** An API that hangs on confirm, exactly as a killed turn experiences it. */
+function stalledConfirm() {
+  const api = {
+    holdSlot: async () => ({ hold_id: 'hold-2', expires_in_seconds: 300 }),
+    confirmAppointment: () => new Promise<never>(() => {}),
+  } as unknown as CedarRidgeClient;
+
+  return api;
+}
+
+/** An API that answers the second confirm with the appointment it already made. */
+function idempotentConfirm() {
+  const confirms: string[] = [];
+
+  const api = {
+    confirmAppointment: async ({ hold_id }: { hold_id: string }) => {
+      confirms.push(hold_id);
+      return {
+        id: 'appt-1',
+        service_name: 'Adult Cleaning',
+        starts_at: '2026-08-03T15:00:00Z',
+        duration_minutes: 60,
+        provider: { id: 'p1', name: 'Tom Becker RDH', type: 'hygienist' },
+        status: 'confirmed',
+        self_pay_price: 12500,
+      };
+    },
+  } as unknown as CedarRidgeClient;
+
+  return { api, confirms };
+}
+
+const held = (session: Session) => {
+  session.hold = {
+    holdId: 'hold-1',
+    slotId: 'slot-1',
+    service: 'D1110',
+    startsAtUtc: '2026-08-03T15:00:00Z',
+    expiresAtMs: Date.now() + 300_000,
+  };
+  return session;
+};
+
+const call = (
+  api: CedarRidgeClient,
+  session: Session,
+  name: 'holdSlot' | 'confirmAppointment',
+  input: unknown = {},
+) =>
+  (
+    appointmentTools(api, session)[name].execute as unknown as (
+      input: unknown,
+    ) => Promise<Record<string, unknown>>
+  )(input);
+
+describe('a confirmation that was never answered', () => {
+  it('is recorded before the request, not after it', async () => {
+    const session = held(readySession());
+
+    // Started and abandoned, as the turn deadline does.
+    void call(stalledConfirm(), session, 'confirmAppointment');
+    await Promise.resolve();
+
+    expect(session.pendingConfirm?.holdId).toBe('hold-1');
+    expect(session.booked).toHaveLength(0);
+  });
+
+  it('blocks a fresh hold, which is the first step of booking twice', async () => {
+    const session = readySession();
+    session.pendingConfirm = {
+      holdId: 'hold-1',
+      service: 'D1110',
+      startsAtUtc: '2026-08-03T15:00:00Z',
+    };
+    session.slotRefs.set('1', { slotId: 'slot-9', startsAtUtc: '2026-08-04T15:00:00Z' });
+
+    const result = await call(stalledConfirm(), session, 'holdSlot', {
+      ref: '1',
+      service: 'D1110',
+    });
+
+    expect(result.ok).toBe(false);
+    expect(String(result.guidance)).toMatch(/confirmAppointment first/);
+  });
+
+  it('re-sends the same hold and takes the appointment the API returns', async () => {
+    const { api, confirms } = idempotentConfirm();
+    const session = readySession();
+    // The hold is gone — only the unanswered confirmation is left, which is
+    // exactly the state a killed turn leaves on another instance.
+    session.pendingConfirm = {
+      holdId: 'hold-1',
+      service: 'D1110',
+      startsAtUtc: '2026-08-03T15:00:00Z',
+    };
+
+    const result = await call(api, session, 'confirmAppointment');
+
+    expect(confirms).toEqual(['hold-1']);
+    expect(result.status).toBe('confirmed');
+    expect(session.booked).toHaveLength(1);
+    expect(session.pendingConfirm).toBeUndefined();
+  });
+
+  it('does not book twice when the same appointment comes back again', async () => {
+    const { api } = idempotentConfirm();
+    const session = held(readySession());
+
+    await call(api, session, 'confirmAppointment');
+    session.hold = {
+      holdId: 'hold-1',
+      slotId: 'slot-1',
+      service: 'D1110',
+      startsAtUtc: '2026-08-03T15:00:00Z',
+      expiresAtMs: Date.now() + 300_000,
+    };
+    await call(api, session, 'confirmAppointment');
+
+    expect(session.booked).toHaveLength(1);
+  });
+
+  it('stands down once the API has answered, even with an error', async () => {
+    const session = held(readySession());
+    const api = {
+      confirmAppointment: async () => {
+        throw new CedarRidgeError('HOLD_ALREADY_USED', 'superseded', 409, {});
+      },
+    } as unknown as CedarRidgeClient;
+
+    const result = await call(api, session, 'confirmAppointment');
+
+    // A 409 is the API telling us where it stands. Only silence is ambiguous,
+    // and treating an answered error as ambiguous would lock the conversation
+    // out of booking the slot the patient actually chose.
+    expect(result.ok).toBe(false);
+    expect(session.pendingConfirm).toBeUndefined();
   });
 });

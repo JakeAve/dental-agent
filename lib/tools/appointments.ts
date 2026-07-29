@@ -1,6 +1,6 @@
 import { tool } from 'ai';
 import { z } from 'zod';
-import type { Appointment, CedarRidgeClient } from '../cedar-ridge';
+import { CedarRidgeError, type Appointment, type CedarRidgeClient } from '../cedar-ridge';
 import { insuranceBlocks, type Session } from '../session';
 import { partOfDay, toPracticeTime } from '../time';
 import { withRecovery } from './errors';
@@ -35,6 +35,32 @@ function summarize(appt: Appointment) {
     status: appt.status,
     price: describePrice(appt),
   };
+}
+
+/**
+ * Confirms a hold, and settles the record of whether it was ever answered.
+ *
+ * Any reply resolves that question, an error included: a 409 or a 410 is the
+ * API telling us where it stands, and the ambiguity worth guarding against is
+ * silence — a turn killed by its deadline mid-request. So the pending marker is
+ * cleared on both paths here, and left standing only when nothing came back at
+ * all. Without that distinction, an expected 409 on a superseded hold would
+ * lock the conversation out of booking the slot the patient actually chose.
+ */
+async function confirmed(
+  api: CedarRidgeClient,
+  holdId: string,
+  notes: string | undefined,
+  session: Session,
+) {
+  try {
+    const appt = await api.confirmAppointment({ hold_id: holdId, notes });
+    session.pendingConfirm = undefined;
+    return appt;
+  } catch (err) {
+    if (err instanceof CedarRidgeError) session.pendingConfirm = undefined;
+    throw err;
+  }
 }
 
 const NO_PATIENT = {
@@ -208,6 +234,22 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
         withRecovery(async () => {
           if (!session.patient) return NO_PATIENT;
 
+          // Refused rather than discouraged. A hold taken while a submitted
+          // booking's outcome is unknown is the first step of a duplicate
+          // booking, and prompt wording is not a guarantee — this is.
+          if (session.pendingConfirm && !session.booked.length) {
+            return {
+              ok: false as const,
+              problem:
+                'A booking was already submitted for this patient and its ' +
+                'outcome is still unknown.',
+              guidance:
+                'Call confirmAppointment first. Confirming the same hold twice ' +
+                'is safe and returns the existing appointment if there is one. ' +
+                'Holding another slot now risks booking this patient twice.',
+            };
+          }
+
           const slot = slotRefs.get(ref.trim());
           if (!slot) {
             return {
@@ -259,7 +301,14 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
           // The model will occasionally try to confirm before holding anything.
           // The API would reject it, but that burns a call from a metered
           // budget and reads to the patient as a failed booking.
-          if (!session.hold) {
+          //
+          // A submitted booking whose answer never arrived counts as something
+          // to confirm even when the hold is gone or looks lapsed: re-sending
+          // it is the only way to find out whether it exists, and the API
+          // documents that as safe.
+          const target = session.hold ?? session.pendingConfirm;
+
+          if (!target) {
             return {
               ok: false as const,
               problem: 'There is no active hold to confirm.',
@@ -269,10 +318,16 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
             };
           }
 
-          const appt = await api.confirmAppointment({
-            hold_id: session.hold.holdId,
-            notes,
-          });
+          // Recorded before the call, not after. The deadline can fire while
+          // this request is in flight, and the far end does not stop: the
+          // appointment may exist with its id in a response nobody read.
+          session.pendingConfirm = {
+            holdId: target.holdId,
+            service: target.service,
+            startsAtUtc: target.startsAtUtc,
+          };
+
+          const appt = await confirmed(api, target.holdId, notes, session);
 
           if (!session.booked.some((b) => b.id === appt.id)) {
             session.booked.push({
