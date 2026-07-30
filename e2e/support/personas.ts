@@ -186,6 +186,23 @@ export const PERSONAS: Record<string, Persona> = {
     maxTurns: 6,
     maxBookings: 0,
   },
+
+  S24c: {
+    id: 'S24c',
+    title: 'Asks whether a plan is accepted, before giving any details',
+    goal:
+      'You want to know whether the practice takes Guardian before you go any ' +
+      'further. Ask that and nothing else. Do not volunteer your member ID or ' +
+      'your date of birth, and do not agree to book anything yet — you are ' +
+      'only checking. If you are asked for details, say you will get your card ' +
+      'in a minute and ask again whether Guardian is taken.',
+    facts: {
+      insurer: 'Guardian',
+      'patient status': 'I have been to this practice before',
+    },
+    maxTurns: 4,
+    maxBookings: 0,
+  },
 };
 
 export const personasFor = (ids: string[]): Persona[] =>
