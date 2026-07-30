@@ -192,6 +192,22 @@ export function patientTools(api: CedarRidgeClient, session: Session) {
             name: `${patient.first_name} ${patient.last_name}`,
             status: patient.status,
             insuranceStatus: patient.insurance_status,
+            /**
+             * The fields as they now stand, so a question about the record is
+             * answered by reading rather than by reassuring — asked what was on
+             * file, this agent has said "no last name on record" of a record
+             * that had one, and claimed to be missing an address it had.
+             *
+             * The address is marked as submitted because the API's patient
+             * response does not echo it back at all. That is the honest reason
+             * there was nothing solid to say about it, and the distinction
+             * matters: everything else here is what the API confirmed.
+             */
+            record: {
+              firstName: patient.first_name,
+              lastName: patient.last_name,
+              addressLine1AsSubmitted: input.address_line1,
+            },
             next: 'Settle insurance with verifyInsurance before searching availability.',
           };
         }, 'registerPatient'),
