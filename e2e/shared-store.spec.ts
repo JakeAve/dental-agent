@@ -71,6 +71,29 @@ describe.skipIf(!store)('the shared store, against real Redis', () => {
     expect(JSON.stringify(await store!.loadRun(runId))).toContain('p-one');
   });
 
+  /**
+   * The write side of the patient guard, in the script rather than in the
+   * caller. A run rebuilt from visible history knows no patient and can still
+   * out-count the copy that registered one, and a write that drops it costs a
+   * duplicate patient record — the one thing the sandbox keeps and the
+   * evaluator reads.
+   */
+  it('refuses a write that would drop the patient id, however far ahead it is', async () => {
+    const runId = `e2e-cas-${randomUUID()}`;
+
+    expect(await store!.saveRun(runId, run(2, 'p-known'))).toBe(true);
+
+    const patientless = {
+      seq: 40,
+      rev: 40,
+      session: { slotRefs: [], booked: [], resolved: false },
+      messages: [{ role: 'user' as const, content: 'and what does a cleaning cost?' }],
+    };
+
+    expect(await store!.saveRun(runId, patientless)).toBe(false);
+    expect(JSON.stringify(await store!.loadRun(runId))).toContain('p-known');
+  });
+
   it('starts a run that has never been written', async () => {
     const runId = `e2e-cas-${randomUUID()}`;
 

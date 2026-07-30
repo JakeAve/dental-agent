@@ -602,3 +602,162 @@ describe('a confirmation with no definitive answer', () => {
     expect(result.ok).toBe(false);
   });
 });
+
+describe('matching an unanswered confirmation to a booking', () => {
+  const bookingAt = (startsAtUtc: string, holdId: string) => ({
+    id: `appt-${holdId}`,
+    service: 'Cleaning',
+    startsAtUtc,
+    provider: 'Dr Chen',
+    price: 'Self-pay. Patient owes $125.00.',
+    holdId,
+  });
+
+  it('records which hold produced the booking', async () => {
+    const { api } = idempotentConfirm();
+    const session = held(readySession());
+
+    await call(api, session, 'confirmAppointment');
+
+    expect(session.booked[0].holdId).toBe('hold-1');
+  });
+
+  /**
+   * Two providers can be free at the same instant, so a start time cannot
+   * identify a booking. Matching on it meant a second booking submitted for an
+   * hour the patient was already booked at read as answered the moment it was
+   * set — losing the guard exactly where a duplicate was in flight.
+   */
+  it('is not answered by a different booking that happens to share its hour', async () => {
+    const session = readySession();
+    session.booked = [bookingAt('2026-08-10T15:00:00Z', 'hold-1')];
+    session.pendingConfirm = {
+      holdId: 'hold-2',
+      service: 'D1110',
+      startsAtUtc: '2026-08-10T15:00:00Z',
+      attempts: 1,
+    };
+    session.slotRefs.set('1', { slotId: 'slot-9', startsAtUtc: '2026-08-11T15:00:00Z' });
+
+    const result = await call(stalledConfirm(), session, 'holdSlot', {
+      ref: '1',
+      service: 'D1110',
+    });
+
+    expect(result.ok).toBe(false);
+  });
+
+  it('is answered by the booking that came from its own hold', async () => {
+    const session = readySession();
+    session.booked = [bookingAt('2026-08-10T15:00:00Z', 'hold-2')];
+    session.pendingConfirm = {
+      holdId: 'hold-2',
+      service: 'D1110',
+      startsAtUtc: '2026-08-10T15:00:00Z',
+      attempts: 1,
+    };
+    session.slotRefs.set('1', { slotId: 'slot-9', startsAtUtc: '2026-08-11T15:00:00Z' });
+
+    const result = await call(stalledConfirm(), session, 'holdSlot', {
+      ref: '1',
+      service: 'D1110',
+    });
+
+    // The outcome is known, so nothing is being guarded against any more.
+    expect(result.ok).not.toBe(false);
+  });
+});
+
+describe('classifying a failed confirmation', () => {
+  const failing = (status: number, code: 'UNKNOWN' | 'HOLD_ALREADY_USED') =>
+    ({
+      confirmAppointment: async () => {
+        throw new CedarRidgeError(code, 'upstream', status, {});
+      },
+    }) as unknown as CedarRidgeClient;
+
+  it('treats a 4xx as an answer even when the body did not parse', async () => {
+    const session = held(readySession());
+
+    // A proxy-generated 403 with an HTML body arrives as UNKNOWN. The request
+    // was refused, so nothing was created — counting it as unknown burned a
+    // strike against an outcome that was never in doubt.
+    await call(failing(403, 'UNKNOWN'), session, 'confirmAppointment');
+
+    expect(session.pendingConfirm).toBeUndefined();
+  });
+
+  it('still treats a 5xx as silence', async () => {
+    const session = held(readySession());
+
+    await call(failing(502, 'UNKNOWN'), session, 'confirmAppointment');
+
+    expect(session.pendingConfirm?.attempts).toBe(1);
+  });
+});
+
+/**
+ * The model repeats a search when the time it offered is taken — SLOT_TAKEN's
+ * own guidance tells it to. Gating widening on "first time we have seen these
+ * arguments" meant the repeat came back empty and the tool then stated a reason
+ * that was not true, telling the agent to say there is nothing while the next
+ * two months were open.
+ */
+describe('a search repeated after its slot was taken', () => {
+  it('widens the repeat too, rather than calling a narrow window empty', async () => {
+    const openFrom = addDays(practiceDate(), 40)!;
+    const narrow = { from: practiceDate(), to: addDays(practiceDate(), 3)! };
+    let slotsGone = false;
+
+    const calls: Array<{ from?: string; to?: string }> = [];
+    const api = {
+      getAvailability: async (params: { from?: string; to?: string; page?: number }) => {
+        calls.push({ from: params.from, to: params.to });
+        const reaches = isCalendarDate(params.to) ? params.to >= openFrom : false;
+        const empty = slotsGone && !reaches;
+
+        return {
+          availability: empty || !reaches ? [] : [slot(1, `${openFrom}T15:00:00Z`)],
+          page: params.page ?? 1,
+          total_pages: reaches && !empty ? 1 : 0,
+        };
+      },
+    } as unknown as CedarRidgeClient;
+
+    const session = readySession();
+
+    // First time: the narrow window is empty, so it widens and finds something.
+    await search(api, session, { service: 'D1110', ...narrow });
+    slotsGone = true;
+
+    // Same arguments again. The window it will page is the widened one, which
+    // still reaches the openings, so no false dead end.
+    const again = await search(api, session, { service: 'D1110', ...narrow });
+
+    expect(String(again.guidance)).not.toMatch(/Tell the patient plainly/);
+    expect(calls.at(-1)?.to).toBe(addDays(practiceDate(), WIDENED_SEARCH_DAYS));
+  });
+
+  it('does not promise refs it just cleared', async () => {
+    const { api } = fakeApi(1);
+    const session = readySession();
+
+    // Page 1 of the default window offers a time.
+    const first = await search(api, session, { service: 'D1110' });
+    expect((first.slots as unknown[]).length).toBeGreaterThan(0);
+
+    // Then a different window, carrying the page number over. The refs from the
+    // first search are gone; saying they are "still good" sends the patient's
+    // chosen time to a dead end.
+    const next = await search(api, session, {
+      service: 'D1110',
+      from: '2026-09-01',
+      to: '2026-09-03',
+      page: 2,
+    });
+
+    if ((next.slots as unknown[]).length === 0 && Number(next.page) > 1) {
+      expect(String(next.guidance)).toMatch(/refs are gone/);
+    }
+  });
+});

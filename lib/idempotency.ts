@@ -95,6 +95,16 @@ local raw = redis.call('GET', KEYS[1])
 if raw then
   local ok, current = pcall(cjson.decode, raw)
   if ok and type(current) == 'table' then
+    -- The patient id outranks the ordering, in this direction as well as in
+    -- the one run-store guards. A run rebuilt from visible history knows no
+    -- patient and can still out-count the copy that registered one, and a
+    -- write that drops it costs a duplicate patient record.
+    local mine = cjson.decode(ARGV[1])
+    if current.session and current.session.patient
+       and not (mine.session and mine.session.patient) then
+      return 0
+    end
+
     local seq = tonumber(current.seq)
     local rev = tonumber(current.rev) or 0
     if seq ~= nil then

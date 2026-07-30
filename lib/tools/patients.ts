@@ -294,8 +294,13 @@ export function patientTools(api: CedarRidgeClient, session: Session) {
               knownPayers: resolved.options,
               note: resolved.ambiguous
                 ? `"${payer}" could be ${resolved.ambiguous.join(' or ')}. Ask which one.`
-                : `"${payer}" is not an insurer this practice works with. Tell ` +
-                  'the patient and offer the self-pay price.',
+                : // Recognition, not acceptance. Saying the practice will not
+                  // take a plan is a claim only verifyInsurance can support,
+                  // and a patient told it here would believe it.
+                  `"${payer}" is not an insurer this system recognises, which ` +
+                  'is a different thing from one the practice will not take. ' +
+                  'Read the name back to check it, or offer to go ahead as ' +
+                  'self-pay. Do not tell them their insurer is not accepted.',
             };
           }
           const payerId = resolved.payer.payer_id;

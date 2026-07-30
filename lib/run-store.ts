@@ -180,9 +180,17 @@ function shouldAdopt(
   // A run rebuilt from visible history knows no patient, and nothing about the
   // ordering can express how much that costs: booking against it registers the
   // same person a second time, in a system the evaluator reads directly. So a
-  // stored copy that knows who the patient is always wins over one that does
-  // not, whatever the counts say.
-  if (restored.session.patient && !run.session.patient) return true;
+  // copy that knows who the patient is beats one that does not, in both
+  // directions and whatever the counts say — a patientless run can accumulate
+  // more messages than the copy that registered the patient (three tool calls
+  // answering a question about prices will do it), and ordering on the count
+  // alone would then adopt away the one fact that cannot be re-derived.
+  if (restored.session.patient !== undefined && run.session.patient === undefined) {
+    return true;
+  }
+  if (restored.session.patient === undefined && run.session.patient !== undefined) {
+    return false;
+  }
 
   const theirs = versionOf(restored);
   const ours = versionOf(run);

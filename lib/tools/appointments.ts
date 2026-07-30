@@ -52,15 +52,20 @@ function summarize(appt: Appointment) {
 /**
  * True when a failed confirm tells us where the booking actually stands.
  *
- * A 409 or a 410 does: the hold was consumed, superseded or lapsed, and the
- * conversation can move on — which S27 and S28 both depend on, since an
- * expected error there must not lock the agent out of booking the slot the
- * patient chose. A 5xx does not. Nor does a body this client cannot read: both
- * mean the request may well have been carried out and we simply do not know,
- * which is the same position a turn killed mid-request leaves us in.
+ * A 4xx does, whether or not the body parsed: the request was refused, so
+ * nothing was created, and the conversation can move on — which S27 and S28
+ * both depend on, since an expected 409 or 410 must not lock the agent out of
+ * booking the slot the patient chose. A 5xx does not: the write may well have
+ * been carried out and we simply do not know, which is the position a turn
+ * killed mid-request leaves us in. Neither does a response this client cannot
+ * read at all, which arrives as something other than a CedarRidgeError.
+ *
+ * The distinction earns its keep on the attempt counter: classing an
+ * unparseable 403 as unknown burned strikes against an outcome that was never
+ * in doubt.
  */
 const definitive = (err: unknown) =>
-  err instanceof CedarRidgeError && err.status < 500 && err.code !== 'UNKNOWN';
+  err instanceof CedarRidgeError && err.status >= 400 && err.status < 500;
 
 /**
  * Confirms a hold, and settles the record of whether it was ever answered.
@@ -175,7 +180,12 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
           // being deleted.
           let searched = continuing ? (session.slotWindow ?? { from, to }) : { from, to };
           let result = await search(searched);
-          let widened = continuing && searched.from !== from;
+          // Either bound moving means these times are not the ones asked for.
+          // Comparing only `from` missed the common case, since widening keeps
+          // the requested start and moves the end — so page 2 of a widened
+          // search presented out-of-window times as though they were requested.
+          let widened =
+            continuing && (searched.from !== from || searched.to !== to);
 
           // An empty first page used to be answered with a paragraph asking the
           // model to search again over 30 to 60 days. It usually did. "Usually"
@@ -183,14 +193,21 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
           // practice is full when it has openings all month, and one extra call
           // buys the certainty. Only from the first page, because a later page
           // coming back empty means the window ran out of pages, not of days.
-          if (result.availability.length === 0 && (page ?? 1) === 1 && !continuing) {
-            const wideFrom = isCalendarDate(from) ? from : practiceDate();
+          if (result.availability.length === 0 && (page ?? 1) === 1) {
+            const wideFrom = isCalendarDate(searched.from)
+              ? searched.from
+              : practiceDate();
             const wideTo = addDays(wideFrom, WIDENED_SEARCH_DAYS);
 
-            // Skipped when the caller already asked to look at least that far.
-            // Compared only between well-formed dates: "2026-8-5" sorts before
+            // Measured against the window actually searched, which is what makes
+            // this safe to run on a repeat: a search that already widened has
+            // `searched.to` at sixty days and is left alone, while a narrow
+            // window the model is re-running — because the slot it offered was
+            // taken — gets the same widening it got the first time. Compared
+            // only between well-formed dates: "2026-8-5" sorts before
             // "2026-09-27" and would read as the wider window of the two.
-            const alreadyWide = isCalendarDate(to) && wideTo !== undefined && to >= wideTo;
+            const alreadyWide =
+              isCalendarDate(searched.to) && wideTo !== undefined && searched.to >= wideTo;
 
             if (wideTo && !alreadyWide) {
               widened = true;
@@ -220,24 +237,32 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
                 // agent came to tell patients a month was full.
                 result.page > 1
                   ? // A later page. Whether it ran off the end of the count or
-                    // its slots were taken since, the earlier pages of this
-                    // search still hold real times — so this is never grounds
-                    // for telling the patient there is nothing.
+                    // its slots were taken since, this is never grounds for
+                    // telling the patient there is nothing — but only say the
+                    // earlier refs are good when they are. Asking for page 2 of
+                    // a window you have not fetched page 1 of clears them, and
+                    // promising a ref that has just been deleted sends the
+                    // patient's chosen time to a dead end.
                     `Page ${result.page} of this search has nothing on it (it ` +
-                    `reports ${result.total_pages} page(s)). The times from the ` +
-                    'pages you already fetched are still on offer and their refs ' +
-                    'are still good. Go back to those, or search a different ' +
-                    'window — do NOT tell the patient there is no availability.'
+                    `reports ${result.total_pages} page(s)). ` +
+                    (continuing
+                      ? 'The times from the pages you already fetched are still ' +
+                        'on offer and their refs are still good — go back to ' +
+                        'those, or search a different window.'
+                      : 'This is a different search from the one those times ' +
+                        'came from, so their refs are gone. Search this window ' +
+                        'from page 1 before offering anything.') +
+                    ' Do NOT tell the patient there is no availability.'
                   : widened
                     ? `Nothing open in the next ${WIDENED_SEARCH_DAYS} days. ` +
                       'This search was already widened to that automatically, so ' +
                       'searching wider will return the same nothing. That makes ' +
                       'it a real dead end: say so, and give them the office ' +
                       `number, ${PRACTICE.phone}.`
-                    : 'Nothing open in the window that was searched, and it was ' +
-                      'not widened — you asked to look at least ' +
-                      `${WIDENED_SEARCH_DAYS} days out already. Tell the patient ` +
-                      'plainly rather than repeating the same search.',
+                    : `Nothing open between ${searched.from ?? 'today'} and ` +
+                      `${searched.to ?? 'the end of the window'}, which already ` +
+                      `reaches at least ${WIDENED_SEARCH_DAYS} days out. Tell ` +
+                      'the patient plainly rather than repeating the same search.',
             };
           }
 
@@ -444,6 +469,7 @@ export function appointmentTools(api: CedarRidgeClient, session: Session) {
               startsAtUtc: appt.starts_at,
               provider: appt.provider.name,
               price: describePrice(appt),
+              holdId: target.holdId,
             });
           }
           session.hold = undefined;

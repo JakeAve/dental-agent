@@ -38,8 +38,11 @@ function fakeRedis(): RedisLike & { store: Map<string, unknown> } {
     async eval(_script, keys, args) {
       const [body, seq, rev] = args as [string, number, number];
       const current = store.get(keys[0]) as
-        | { seq?: unknown; rev?: unknown }
+        | { seq?: unknown; rev?: unknown; session?: { patient?: unknown } }
         | undefined;
+      const mine = JSON.parse(body) as { session?: { patient?: unknown } };
+
+      if (current?.session?.patient && !mine.session?.patient) return 0 as never;
 
       if (current && typeof current.seq === 'number') {
         const currentRev = typeof current.rev === 'number' ? current.rev : 0;

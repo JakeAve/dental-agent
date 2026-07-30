@@ -314,3 +314,46 @@ describe('deserializeRun', () => {
     expect(back?.messages).toHaveLength(1);
   });
 });
+
+/**
+ * The patient id is the one fact that cannot be re-derived: there is no endpoint
+ * that finds a patient, so an agent that cannot see its own registration
+ * registers the person again, in a system the evaluator reads directly. A run
+ * rebuilt from visible history has no patient and can still out-count the copy
+ * that has one — three tool calls answering a question about prices will do it —
+ * so the count must not be allowed to decide this.
+ */
+describe('adoption and the patient id', () => {
+  const withPatient = (messages: number) => ({
+    seq: messages,
+    rev: 1,
+    session: stored({ id: 'p-real', name: 'Dana Reed', status: 'returning' }),
+    messages: Array.from({ length: messages }, (_, i) => ({
+      role: 'user',
+      content: `m${i}`,
+    })),
+  });
+
+  const withoutPatient = (messages: number) => ({
+    seq: messages,
+    rev: 9,
+    session: { slotRefs: [], booked: [], resolved: false },
+    messages: Array.from({ length: messages }, (_, i) => ({
+      role: 'user',
+      content: `m${i}`,
+    })),
+  });
+
+  it('adopts a copy that knows the patient, however few messages it has', () => {
+    getRun('r1', Array.from({ length: 20 }, () => HISTORY[0]));
+
+    expect(getRun('r1', HISTORY, withPatient(2)).session.patient?.id).toBe('p-real');
+  });
+
+  it('refuses a copy that does not, however many messages it has', () => {
+    const run = getRun('r1', HISTORY);
+    run.session.patient = { id: 'p-real', name: 'Dana Reed', status: 'returning' };
+
+    expect(getRun('r1', HISTORY, withoutPatient(50)).session.patient?.id).toBe('p-real');
+  });
+});

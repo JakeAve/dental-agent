@@ -87,8 +87,11 @@ function recoveryFor(err: CedarRidgeError): Recovery {
         problem: 'That insurer is not one the system recognizes.',
         guidance:
           'Call listPayers and match what the patient said to a real payerId. ' +
-          'If nothing matches, the practice does not work with them — offer ' +
-          'self-pay.',
+          'If nothing matches, say the name did not come up and ask them to ' +
+          'read it off the card, or offer to go ahead as self-pay. Do NOT tell ' +
+          'them the practice does not take their plan — recognising an insurer ' +
+          'and accepting it are different questions, and only verifyInsurance ' +
+          'answers the second.',
         recoverable: true,
       };
 

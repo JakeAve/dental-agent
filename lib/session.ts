@@ -104,6 +104,13 @@ export type Session = {
     startsAtUtc: string;
     provider: string;
     price: string;
+    /**
+     * The hold this came from, so an unanswered confirmation can be matched to
+     * it exactly. A start time cannot do that: two providers can be free at the
+     * same instant, so a second booking at an hour the patient is already booked
+     * for would read as already answered and lose its guard.
+     */
+    holdId?: string;
   }>;
   /** True once an appointment has actually been booked or cancelled. */
   resolved: boolean;
@@ -121,19 +128,18 @@ export const CONFIRM_ATTEMPT_LIMIT = 3;
 /**
  * A submitted booking whose outcome is still unknown.
  *
- * Not merely "the marker is set": a marker for a slot that is already in
- * `booked` has been answered, and the conversation is free to carry on. Checked
- * against the slot rather than against the count, because a patient booking a
- * second appointment would otherwise be unprotected by the very guard that
- * exists for the first.
+ * Not merely "the marker is set": a marker whose hold is already represented in
+ * `booked` has been answered, and the conversation is free to carry on. Matched
+ * on the hold rather than on the count, because a patient booking a second
+ * appointment would otherwise be unprotected by the very guard that exists for
+ * the first — and on the hold rather than the start time, because two providers
+ * can be free at the same instant.
  */
 export function unresolvedConfirm(session: Session) {
   const pending = session.pendingConfirm;
   if (!pending) return undefined;
 
-  const answered = session.booked.some(
-    (b) => b.startsAtUtc === pending.startsAtUtc,
-  );
+  const answered = session.booked.some((b) => b.holdId === pending.holdId);
   return answered ? undefined : pending;
 }
 
@@ -216,6 +222,8 @@ const persistedSession = z.object({
       startsAtUtc: z.string(),
       provider: z.string(),
       price: z.string(),
+      // Optional so a run written before it existed still restores.
+      holdId: z.string().optional(),
     }),
   ),
   resolved: z.boolean(),
