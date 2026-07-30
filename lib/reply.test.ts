@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { capMessage, collapseRestartedReply, MAX_MESSAGE_BYTES } from './reply';
+import {
+  awaitingReply,
+  capMessage,
+  collapseRestartedReply,
+  MAX_MESSAGE_BYTES,
+} from './reply';
 
 // Both duplicated samples below are verbatim captures from gpt-5.4-mini via
 // runAgentOnce on 2026-07-29 — the model restarted its reply inside a single
@@ -116,6 +121,50 @@ describe('capMessage, at the boundary', () => {
   it('never returns an empty message, whatever it was given', () => {
     for (const input of ['', '   ', '\n\n', ' '.repeat(MAX_MESSAGE_BYTES * 2)]) {
       expect(capMessage(input).trim()).not.toBe('');
+    }
+  });
+});
+
+/**
+ * `complete` is reported when the run has resolved and nothing is outstanding.
+ * A question mark is not the only way of leaving something outstanding — this
+ * was found by driving the deployed agent through a booking and then a
+ * cancellation, where turn 4 asked for a confirmation and reported itself done.
+ */
+describe('awaitingReply', () => {
+  it('recognises a request for confirmation with no question mark in it', () => {
+    // Verbatim from production.
+    expect(
+      awaitingReply(
+        'Sure — I can cancel the Adult Cleaning on Thursday, July 30, 2026 at ' +
+          '9:00 AM MDT with Maria Gonzalez RDH.\n\nPlease confirm you want me ' +
+          'to cancel that appointment.',
+      ),
+    ).toBe(true);
+  });
+
+  it('recognises an ordinary question', () => {
+    expect(awaitingReply('Are you a new or returning patient?')).toBe(true);
+  });
+
+  it('recognises the other ways of asking', () => {
+    for (const asking of [
+      'Let me know which time suits you.',
+      'Please let me know if that works.',
+      'Tell me which day you prefer.',
+      "I'll need your member ID to check that.",
+    ]) {
+      expect(awaitingReply(asking), asking).toBe(true);
+    }
+  });
+
+  it('leaves a finished answer finished', () => {
+    for (const done of [
+      "You're booked for Thursday, July 30, 2026 at 9:00 AM MDT with Maria Gonzalez RDH.",
+      'Cancelled — the Adult Cleaning on Thursday has been removed.',
+      "We're open Monday through Friday, 8:00 AM to 5:00 PM.",
+    ]) {
+      expect(awaitingReply(done), done).toBe(false);
     }
   });
 });

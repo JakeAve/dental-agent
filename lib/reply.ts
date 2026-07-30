@@ -73,6 +73,29 @@ export function capMessage(text: string): string {
   return clean ? `${clean}${ELLIPSIS}` : NOTHING_TO_SAY;
 }
 
+/**
+ * Ways of asking for something that are not questions.
+ *
+ * Observed in production: after a booking, asked to cancel it, the agent said
+ * "Please confirm you want me to cancel that appointment." — an explicit request
+ * for the patient's answer, with no question mark in it, on a turn the run had
+ * already resolved. Reported as `complete`.
+ */
+const ASKS_FOR_A_REPLY =
+  /\b(?:please (?:confirm|reply|respond|let me know|tell me|say|send|share|provide)|let me know|just confirm|confirm (?:that|you|whether|below|when)|tell me (?:which|what|when|whether)|say the word|i(?:'| a)?ll need)\b/i;
+
+/**
+ * True when the reply is waiting on the patient.
+ *
+ * The protocol says completion does not decide success, so this errs towards
+ * `continue`: a run wrongly left open costs nothing, while one closed with a
+ * question outstanding claims the conversation is finished when the agent has
+ * just asked for something.
+ */
+export function awaitingReply(message: string): boolean {
+  return message.includes('?') || ASKS_FOR_A_REPLY.test(message);
+}
+
 export function collapseRestartedReply(text: string): string {
   // The shortest prefix of at least 20 characters ending a sentence. The
   // length floor keeps abbreviations ("Dr.") and stub sentences from matching.

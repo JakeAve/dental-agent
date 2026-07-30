@@ -12,7 +12,7 @@ import {
   serializeRun,
   type Turn,
 } from '@/lib/run-store';
-import { capMessage, collapseRestartedReply } from '@/lib/reply';
+import { awaitingReply, capMessage, collapseRestartedReply } from '@/lib/reply';
 
 /**
  * The candidate-agent/1 endpoint the evaluator's synthetic patient talks to.
@@ -307,11 +307,12 @@ async function handleTurn(
       message,
       // The evaluator may still send another turn after `complete`, and
       // completion is not what it scores — so this only claims done once
-      // something real happened and we are not waiting on an answer. Any
-      // question at all means we are still waiting, including "shall I cancel
-      // that?" after a successful booking.
+      // something real happened and we are not waiting on an answer. A question
+      // mark is not the only way of asking: "Please confirm you want me to
+      // cancel that appointment" was reported as complete in production, on a
+      // turn that was plainly waiting for a yes.
       status:
-        run.session.resolved && !message.includes('?') ? 'complete' : 'continue',
+        run.session.resolved && !awaitingReply(message) ? 'complete' : 'continue',
     };
   })();
 
